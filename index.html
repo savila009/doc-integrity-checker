@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document Integrity Checker</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>Document Integrity Checker</h1>
+      <p class="subtitle">
+        Upload one document and scan for tampering clues. Choose a document type
+        to run tailored checks for bank statements, pay stubs, or IDs.
+      </p>
+
+      <section class="card uploader">
+        <div class="field">
+          <label for="docType">Document type (auto-detected)</label>
+          <select id="docType" disabled>
+            <option value="auto" selected>Auto-detect (pending analysis)</option>
+            <option value="bank">Bank statement</option>
+            <option value="paystub">Pay stub</option>
+            <option value="id">Driver license / Identification card</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="scanMode">Scan reliability mode</label>
+          <select id="scanMode">
+            <option value="standard">Standard</option>
+            <option value="forensic" selected>High reliability (forensic)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="detectionConfidence">Detection confidence</label>
+          <input id="detectionConfidence" type="text" value="Pending analysis" readonly />
+        </div>
+        <div class="field">
+          <label for="docFile">Document to inspect (PDF or image)</label>
+          <div class="dropzone" id="docDropzone" data-input-id="docFile">
+            <p>Drag & drop document here</p>
+            <small>or click to choose</small>
+          </div>
+          <input id="docFile" type="file" accept=".pdf,image/*" />
+        </div>
+        <button id="analyzeBtn" type="button">Inspect Document</button>
+      </section>
+
+      <section class="card status-card">
+        <h2>Progress</h2>
+        <p id="status">Upload one document to begin analysis.</p>
+        <p class="note">
+          Legal note: this tool is a screening aid, not definitive legal proof.
+          Preserve originals and verify with manual review or licensed forensic experts.
+        </p>
+      </section>
+
+      <section class="card hidden" id="resultsCard">
+        <h2>Results</h2>
+        <div class="stats">
+          <div class="stat">
+            <span class="label">Risk score (0-100)</span>
+            <span class="value danger" id="riskScore">0</span>
+          </div>
+          <div class="stat">
+            <span class="label">Suspicious clues</span>
+            <span class="value warn" id="totalFlags">0</span>
+          </div>
+          <div class="stat">
+            <span class="label">Extracted text length</span>
+            <span class="value" id="textLength">0</span>
+          </div>
+        </div>
+
+        <h3>Analysis summary</h3>
+        <div id="analysisSummary" class="card summary-card"></div>
+
+        <h3>Potential edit clues</h3>
+        <div id="issuesList" class="issues"></div>
+
+        <h3>Document view with highlighted areas</h3>
+        <div id="documentPreview" class="preview-list"></div>
+      </section>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
