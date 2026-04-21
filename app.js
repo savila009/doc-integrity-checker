@@ -359,6 +359,7 @@ async function inspectDocument(extracted, selectedType, scanMode) {
       ...findValueFormatSwitchClues(text),
       ...findAmountOutlierClues(text),
       ...findBankStatementMathClues(text, profile),
+      ...findBankLineItemTotalClues(text, profile),
       ...findBankRunningBalanceClues(text, profile),
       ...findPayStubMathClues(text, profile),
       ...findPayStubLineItemClues(text, profile),
@@ -646,6 +647,77 @@ function findBankStatementMathClues(text, profile) {
   return clues;
 }
 
+function findBankLineItemTotalClues(text, profile) {
+  if (!profile.likelyBankStatement) {
+    return [];
+  }
+
+  const rows = extractBankTransactionRows(text);
+  if (rows.length < 2) {
+    return [];
+  }
+
+  const opening = getPrimaryAmountByKeywords(text, ["beginning balance", "opening balance", "starting balance"]);
+  const declaredDeposits = getPrimaryAmountByKeywords(text, ["total deposits", "deposits total", "total credits"]);
+  const declaredDebits = getPrimaryAmountByKeywords(text, ["total withdrawals", "withdrawals total", "total debits", "debits total"]);
+  if (!Number.isFinite(declaredDeposits) && !Number.isFinite(declaredDebits)) {
+    return [];
+  }
+
+  let computedDepositCents = 0;
+  let computedDebitCents = 0;
+  let unknownRows = 0;
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const previousBalance = i === 0 ? opening : rows[i - 1].balance;
+    const signedAmountCents = resolveRowSignedAmountCents(rows[i], previousBalance);
+    if (!Number.isFinite(signedAmountCents) || signedAmountCents === 0) {
+      unknownRows += 1;
+      continue;
+    }
+    if (signedAmountCents > 0) {
+      computedDepositCents += signedAmountCents;
+    } else {
+      computedDebitCents += Math.abs(signedAmountCents);
+    }
+  }
+
+  const clues = [];
+  if (Number.isFinite(declaredDeposits)) {
+    const depositDeltaCents = Math.abs(computedDepositCents - toCents(declaredDeposits));
+    if (depositDeltaCents > 0) {
+      clues.push({
+        type: "Bank math mismatch",
+        title: "Individual deposits do not add up to total deposits",
+        snippet: `Line-item deposits ${toMoney(computedDepositCents / 100)} vs total deposits ${toMoney(
+          declaredDeposits
+        )}, mismatch ${toMoney(depositDeltaCents / 100)}. Unknown rows: ${unknownRows}.`,
+        rawMatch: "total deposits",
+        weight: 10,
+        confidence: unknownRows === 0 ? 0.95 : 0.82,
+      });
+    }
+  }
+
+  if (Number.isFinite(declaredDebits)) {
+    const debitDeltaCents = Math.abs(computedDebitCents - toCents(declaredDebits));
+    if (debitDeltaCents > 0) {
+      clues.push({
+        type: "Bank math mismatch",
+        title: "Individual debits do not add up to total debits/withdrawals",
+        snippet: `Line-item debits ${toMoney(computedDebitCents / 100)} vs total debits ${toMoney(
+          declaredDebits
+        )}, mismatch ${toMoney(debitDeltaCents / 100)}. Unknown rows: ${unknownRows}.`,
+        rawMatch: "total debits",
+        weight: 10,
+        confidence: unknownRows === 0 ? 0.95 : 0.82,
+      });
+    }
+  }
+
+  return clues;
+}
+
 function findBankRunningBalanceClues(text, profile) {
   if (!profile.likelyBankStatement) {
     return [];
@@ -774,6 +846,39 @@ function evaluateRunningBalanceStep(previousBalance, row) {
     toleranceCents,
     withinTolerance: bestDeltaCents <= toleranceCents,
   };
+}
+
+function resolveRowSignedAmountCents(row, previousBalance) {
+  if (!row || !row.amountInfo || !Number.isFinite(row.amountInfo.absolute)) {
+    return NaN;
+  }
+
+  const absoluteCents = toCents(row.amountInfo.absolute);
+  if (!Number.isFinite(absoluteCents) || absoluteCents === 0) {
+    return NaN;
+  }
+
+  if (row.amountInfo.signKnown) {
+    const signed = row.amountInfo.candidates[0] || 0;
+    return toCents(signed);
+  }
+
+  if (Number.isFinite(previousBalance) && Number.isFinite(row.balance)) {
+    const deltaCents = toCents(row.balance) - toCents(previousBalance);
+    if (Math.abs(deltaCents) === absoluteCents && deltaCents !== 0) {
+      return deltaCents > 0 ? absoluteCents : -absoluteCents;
+    }
+  }
+
+  const descriptor = (row.description || "").toLowerCase();
+  if (/(deposit|credit|refund|reversal|payroll)/i.test(descriptor)) {
+    return absoluteCents;
+  }
+  if (/(debit|withdrawal|purchase|pos|atm|fee|payment|transfer out)/i.test(descriptor)) {
+    return -absoluteCents;
+  }
+
+  return NaN;
 }
 
 function findPayStubMathClues(text, profile) {
