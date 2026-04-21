@@ -199,6 +199,7 @@ async function extractFromPdf(file, selectedType, scanMode) {
     canvas.height = viewport.height;
     const context = canvas.getContext("2d");
     await page.render({ canvasContext: context, viewport }).promise;
+    const nativeText = await extractNativePdfPageText(page);
 
     const bestResult = await runOcrWithOptionalIdEnhancement(
       canvas,
@@ -207,7 +208,7 @@ async function extractFromPdf(file, selectedType, scanMode) {
       scanMode
     );
 
-    textParts.push(bestResult.text);
+    textParts.push(selectPdfAnalysisText(nativeText, bestResult.text));
     pages.push({
       pageNumber: pageIndex,
       imageUrl: canvas.toDataURL("image/png"),
@@ -225,6 +226,42 @@ async function extractFromPdf(file, selectedType, scanMode) {
 
 function normalizeText(text) {
   return text.replace(/\s+/g, " ").trim();
+}
+
+async function extractNativePdfPageText(page) {
+  try {
+    const textContent = await page.getTextContent();
+    const items = textContent?.items || [];
+    const chunks = items
+      .map((item) => (typeof item.str === "string" ? item.str : ""))
+      .filter(Boolean);
+    return normalizeText(chunks.join(" "));
+  } catch (error) {
+    return "";
+  }
+}
+
+function selectPdfAnalysisText(nativeText, ocrText) {
+  const nativeNormalized = normalizeText(nativeText || "");
+  const ocrNormalized = normalizeText(ocrText || "");
+  if (isUsableNativePdfText(nativeNormalized, ocrNormalized)) {
+    return nativeNormalized;
+  }
+  return ocrNormalized;
+}
+
+function isUsableNativePdfText(nativeText, ocrText) {
+  if (!nativeText) {
+    return false;
+  }
+  const tokenCount = (nativeText.match(/[A-Za-z0-9]{2,}/g) || []).length;
+  if (tokenCount < 8) {
+    return false;
+  }
+  if (nativeText.length >= Math.max(80, ocrText.length * 0.35)) {
+    return true;
+  }
+  return /\$\s*-?\d/.test(nativeText) || /\b(total|balance|deposit|withdrawal|payroll)\b/i.test(nativeText);
 }
 
 function normalizeOcrWords(words) {
@@ -836,7 +873,7 @@ function parseBankSectionAmounts(sectionText) {
   }
   const sanitized = sectionText.replace(/[−–—]/g, "-");
   const regex =
-    /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\s+(-?\$?\d{1,3}(?:,\d{3})*\.\d{2})\b/gi;
+    /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\s+((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))\b/gi;
   const values = [];
   for (const match of sanitized.matchAll(regex)) {
     const parsed = parseLooseMoneyAmount(match[1]);
@@ -851,12 +888,12 @@ function extractDeclaredBankTotal(text, kind) {
   const patternList =
     kind === "deposits"
       ? [
-          /total(?:\s+[a-z()]+){0,6}\s+deposits?[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
-          /plus\s+deposits?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
+          /total(?:\s+[a-z()]+){0,6}\s+deposits?[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
+          /plus\s+deposits?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
         ]
       : [
-          /total(?:\s+[a-z()]+){0,6}\s+(?:withdrawals?|debits?)[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
-          /less\s+withdrawals?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
+          /total(?:\s+[a-z()]+){0,6}\s+(?:withdrawals?|debits?)[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
+          /less\s+withdrawals?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
         ];
 
   for (const pattern of patternList) {
@@ -1621,10 +1658,11 @@ function findIdAuthenticityClues(text, profile, existingCoreFields) {
 
 function getPrimaryAmountByKeywords(text, keywords) {
   const amounts = [];
+  const normalizedText = normalizeMoneySpacingArtifacts(text);
   for (const keyword of keywords) {
     const escaped = escapeRegExp(keyword);
     const regex = new RegExp(`${escaped}[\\s:\\-]{0,8}(?:[$€£]\\s*)?(-?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)`, "gi");
-    for (const match of text.matchAll(regex)) {
+    for (const match of normalizedText.matchAll(regex)) {
       const value = parseMoney(match[1]);
       if (Number.isFinite(value)) {
         amounts.push(value);
@@ -1668,25 +1706,33 @@ function parseMoney(value) {
   if (!value) {
     return NaN;
   }
-  const parsed = Number(value.replace(/,/g, ""));
+  const normalized = String(value)
+    .replace(/[−–—]/g, "-")
+    .replace(/^\(\s*(.*)\s*\)$/, "-$1")
+    .replace(/\s+/g, "")
+    .replace(/,/g, "")
+    .replace(/\$/g, "");
+  const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function normalizeMoneySpacingArtifacts(text) {
+  if (!text) {
+    return "";
+  }
+  return String(text)
+    .replace(/\$\s+([0-9])/g, "$$$1")
+    .replace(/([0-9])\s*,\s*([0-9]{3})/g, "$1,$2")
+    .replace(/([0-9])\s*\.\s*([0-9]{2})/g, "$1.$2")
+    .replace(/-\s+\$/g, "-$")
+    .replace(/\$\s+-/g, "$-");
 }
 
 function parseLooseMoneyAmount(value) {
   if (!value) {
     return NaN;
   }
-  const normalized = String(value).trim().replace(/,/g, "");
-  const sign = /-\$|\(-?\$|-/.test(normalized) ? -1 : 1;
-  const numericPart = normalized.replace(/[^0-9.]/g, "");
-  if (!numericPart || !/^\d+(?:\.\d{1,2})?$/.test(numericPart)) {
-    return NaN;
-  }
-  const parsed = Number(numericPart);
-  if (!Number.isFinite(parsed)) {
-    return NaN;
-  }
-  return sign * parsed;
+  return parseMoney(value);
 }
 
 function toCents(value) {
