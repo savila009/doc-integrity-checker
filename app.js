@@ -34,7 +34,7 @@ analyzeBtn.addEventListener("click", async () => {
     const extracted = await extractDocumentData(file, selectedType, scanMode);
 
     setStatus("Analyzing for suspicious edit clues...");
-    const report = inspectDocument(extracted, selectedType, scanMode);
+    const report = await inspectDocument(extracted, selectedType, scanMode);
     const withHighlights = attachHighlights(report, extracted.pages);
     renderReport(withHighlights);
     syncDetectedTypeSelector(withHighlights.profile);
@@ -342,7 +342,7 @@ function scoreIdExtractionQuality(text) {
   return score;
 }
 
-function inspectDocument(extracted, selectedType, scanMode) {
+async function inspectDocument(extracted, selectedType, scanMode) {
   const text = extracted.text;
   const profile = detectDocumentProfile(text, selectedType);
   const summary = buildAnalysisSummary(extracted, profile);
@@ -359,9 +359,13 @@ function inspectDocument(extracted, selectedType, scanMode) {
       ...findValueFormatSwitchClues(text),
       ...findAmountOutlierClues(text),
       ...findBankStatementMathClues(text, profile),
+      ...findBankRunningBalanceClues(text, profile),
       ...findPayStubMathClues(text, profile),
+      ...findPayStubLineItemClues(text, profile),
       ...findEmployerLegitimacyClues(text, profile),
     ];
+    const externalClues = await findExternalEmployerVerificationClues(text, profile);
+    rawClues.push(...externalClues);
   }
 
   const clues = rawClues.map((clue, index) => ({
@@ -640,6 +644,134 @@ function findBankStatementMathClues(text, profile) {
   return clues;
 }
 
+function findBankRunningBalanceClues(text, profile) {
+  if (!profile.likelyBankStatement) {
+    return [];
+  }
+
+  const rows = extractBankTransactionRows(text);
+  if (rows.length < 3) {
+    return [];
+  }
+
+  const clues = [];
+  const opening = getPrimaryAmountByKeywords(text, ["beginning balance", "opening balance", "starting balance"]);
+
+  if (Number.isFinite(opening)) {
+    const firstRow = rows[0];
+    const firstEval = evaluateRunningBalanceStep(opening, firstRow);
+    if (!firstEval.withinTolerance && firstEval.delta > 1) {
+      clues.push({
+        type: "Bank math mismatch",
+        title: "First transaction does not reconcile with opening balance",
+        snippet: `Opening ${toMoney(opening)}, transaction ${firstRow.amountRaw}, resulting balance ${toMoney(firstRow.balance)}.`,
+        rawMatch: firstRow.raw,
+        weight: 8,
+        confidence: 0.85,
+      });
+    }
+  }
+
+  for (let i = 1; i < rows.length; i += 1) {
+    const prev = rows[i - 1];
+    const curr = rows[i];
+    const evaluation = evaluateRunningBalanceStep(prev.balance, curr);
+    if (!evaluation.withinTolerance && evaluation.delta > 1.25) {
+      clues.push({
+        type: "Bank math mismatch",
+        title: "Transaction amount does not reconcile with running balance",
+        snippet: `Prior balance ${toMoney(prev.balance)}, transaction ${curr.amountRaw}, next balance ${toMoney(curr.balance)}.`,
+        rawMatch: curr.raw,
+        weight: 8,
+        confidence: 0.84,
+      });
+    }
+    if (clues.length >= 8) {
+      break;
+    }
+  }
+
+  return clues;
+}
+
+function extractBankTransactionRows(text) {
+  const rows = [];
+  const rowRegex =
+    /(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+([A-Za-z0-9&.,'()#\-\/ ]{2,65}?)\s+(\(?-?\$?\d{1,3}(?:,\d{3})*\.\d{2}\)?\s*(?:cr|dr)?)\s+(\(?-?\$?\d{1,3}(?:,\d{3})*\.\d{2}\)?)/gi;
+
+  for (const match of text.matchAll(rowRegex)) {
+    const amountInfo = parseTransactionAmountToken(match[3]);
+    const balance = parseMoney(match[4].replace(/[()$]/g, ""));
+    if (!Number.isFinite(amountInfo.absolute) || !Number.isFinite(balance)) {
+      continue;
+    }
+    rows.push({
+      date: match[1],
+      description: match[2].trim(),
+      amountRaw: match[3].trim(),
+      amountInfo,
+      balance,
+      raw: match[0],
+    });
+    if (rows.length >= 70) {
+      break;
+    }
+  }
+
+  return rows;
+}
+
+function parseTransactionAmountToken(token) {
+  const lower = token.toLowerCase();
+  const hasParens = /\(.*\)/.test(token);
+  const hasMinus = /\-/.test(token);
+  const hasDebit = /\bdr\b/.test(lower);
+  const hasCredit = /\bcr\b/.test(lower);
+  const numeric = parseMoney(token.replace(/[()$]/g, "").replace(/\b(cr|dr)\b/gi, "").trim());
+  const absolute = Number.isFinite(numeric) ? Math.abs(numeric) : NaN;
+
+  if (!Number.isFinite(absolute)) {
+    return { absolute: NaN, candidates: [], signKnown: false };
+  }
+  if (hasDebit || hasParens || hasMinus) {
+    return { absolute, candidates: [-absolute], signKnown: true };
+  }
+  if (hasCredit) {
+    return { absolute, candidates: [absolute], signKnown: true };
+  }
+  return { absolute, candidates: [absolute, -absolute], signKnown: false };
+}
+
+function evaluateRunningBalanceStep(previousBalance, row) {
+  const descriptor = (row.description || "").toLowerCase();
+  let candidateAmounts = [...row.amountInfo.candidates];
+  if (!row.amountInfo.signKnown) {
+    if (/(debit|withdrawal|purchase|pos|atm|fee|payment)/i.test(descriptor)) {
+      candidateAmounts = [-row.amountInfo.absolute];
+    } else if (/(deposit|credit|refund|reversal|payroll)/i.test(descriptor)) {
+      candidateAmounts = [row.amountInfo.absolute];
+    }
+  }
+  if (!candidateAmounts.length) {
+    candidateAmounts = [row.amountInfo.absolute, -row.amountInfo.absolute];
+  }
+
+  let bestDelta = Number.POSITIVE_INFINITY;
+  for (const amount of candidateAmounts) {
+    const expected = previousBalance + amount;
+    const delta = Math.abs(expected - row.balance);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+    }
+  }
+  const tolerance = Math.max(0.75, row.amountInfo.absolute * 0.015);
+  return {
+    delta: bestDelta,
+    tolerance,
+    withinTolerance: bestDelta <= tolerance,
+  };
+}
+
 function findPayStubMathClues(text, profile) {
   if (!profile.likelyPayStub) {
     return [];
@@ -707,6 +839,112 @@ function findPayStubMathClues(text, profile) {
   }
 
   return clues;
+}
+
+function findPayStubLineItemClues(text, profile) {
+  if (!profile.likelyPayStub) {
+    return [];
+  }
+
+  const clues = [];
+  const deductionTotal = getPrimaryAmountByKeywords(text, ["total deductions", "deductions"]);
+  const gross = getPrimaryAmountByKeywords(text, ["gross pay", "current gross"]);
+
+  const deductionItems = collectPayLineItemsByKeywords(text, [
+    "federal tax",
+    "state tax",
+    "local tax",
+    "social security",
+    "medicare",
+    "insurance",
+    "dental",
+    "vision",
+    "retirement",
+    "401k",
+    "garnishment",
+  ]);
+
+  if (Number.isFinite(deductionTotal) && deductionItems.length >= 2) {
+    const deducedTotal = deductionItems.reduce((sum, item) => sum + item.value, 0);
+    const delta = Math.abs(deducedTotal - deductionTotal);
+    const tolerance = Math.max(1.0, deductionTotal * 0.03);
+    if (delta > tolerance) {
+      clues.push({
+        type: "Pay math mismatch",
+        title: "Deduction line items do not add up to total deductions",
+        snippet: `Line items ${toMoney(deducedTotal)} vs total deductions ${toMoney(deductionTotal)}.`,
+        rawMatch: deductionItems[0].raw,
+        weight: 9,
+        confidence: 0.9,
+      });
+    }
+  }
+
+  const earningItems = collectPayLineItemsByKeywords(text, [
+    "regular pay",
+    "overtime",
+    "bonus",
+    "commission",
+    "holiday pay",
+    "vacation pay",
+    "sick pay",
+    "shift differential",
+  ]);
+
+  if (Number.isFinite(gross) && earningItems.length >= 2) {
+    const summedEarnings = earningItems.reduce((sum, item) => sum + item.value, 0);
+    const delta = Math.abs(summedEarnings - gross);
+    const tolerance = Math.max(1.25, gross * 0.03);
+    if (delta > tolerance) {
+      clues.push({
+        type: "Pay math mismatch",
+        title: "Earning components do not add up to gross pay",
+        snippet: `Line items ${toMoney(summedEarnings)} vs gross pay ${toMoney(gross)}.`,
+        rawMatch: earningItems[0].raw,
+        weight: 8,
+        confidence: 0.86,
+      });
+    }
+  }
+
+  return clues;
+}
+
+function collectPayLineItemsByKeywords(text, keywords) {
+  const values = [];
+  const seen = new Set();
+  for (const keyword of keywords) {
+    const escaped = escapeRegExp(keyword);
+    const regex = new RegExp(`${escaped}[\\s:\\-]{0,10}(?:[$€£]\\s*)?(-?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)`, "gi");
+    for (const match of text.matchAll(regex)) {
+      const before = text.slice(Math.max(0, match.index - 18), match.index).toLowerCase();
+      if (before.includes("ytd") || before.includes("year to date")) {
+        continue;
+      }
+      if (/total|current|gross pay|net pay/i.test(match[0])) {
+        continue;
+      }
+      const numeric = parseMoney(match[1]);
+      if (!Number.isFinite(numeric) || numeric <= 0) {
+        continue;
+      }
+      const rounded = numeric.toFixed(2);
+      const dedupeKey = `${keyword}:${rounded}`;
+      if (seen.has(dedupeKey)) {
+        continue;
+      }
+      seen.add(dedupeKey);
+      values.push({
+        keyword,
+        value: numeric,
+        raw: match[0],
+      });
+      if (values.length >= 25) {
+        return values;
+      }
+    }
+  }
+  return values;
 }
 
 function findEmployerLegitimacyClues(text, profile) {
@@ -790,6 +1028,164 @@ function findEmployerLegitimacyClues(text, profile) {
   }
 
   return clues;
+}
+
+async function findExternalEmployerVerificationClues(text, profile) {
+  if (!profile.likelyPayStub) {
+    return [];
+  }
+
+  const employerName = extractEmployerNameForVerification(text);
+  if (!employerName || isGenericEmployerLabel(employerName)) {
+    return [];
+  }
+
+  try {
+    const result = await evaluateEmployerPresence(employerName);
+    if (result.status !== "not_found") {
+      return [];
+    }
+
+    const synthetic = looksSyntheticEmployerName(employerName);
+    if (synthetic) {
+      return [
+        {
+          type: "Employer legitimacy",
+          title: "Employer name not found in public search and appears synthetic",
+          snippet: `${employerName} (no strong public search match)`,
+          rawMatch: employerName,
+          weight: 8,
+          confidence: 0.82,
+        },
+      ];
+    }
+
+    return [
+      {
+        type: "Employer legitimacy",
+        title: "No strong public reference found for employer name",
+        snippet: `${employerName} (manual verification recommended)`,
+        rawMatch: employerName,
+        weight: 0,
+        confidence: 0.65,
+      },
+    ];
+  } catch (error) {
+    // Network access is optional for this signal; local checks still run.
+    return [];
+  }
+}
+
+function extractEmployerNameForVerification(text) {
+  const explicit = text.match(/(?:employer|company|business)\s*[:\-]?\s*([A-Za-z0-9&.,'\-\s]{3,70})/i);
+  if (explicit && explicit[1]) {
+    return explicit[1].trim().replace(/\s+/g, " ");
+  }
+
+  const domainEmail = text.match(/\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/);
+  if (domainEmail && domainEmail[1]) {
+    const domain = domainEmail[1].toLowerCase();
+    if (!/(gmail|yahoo|hotmail|outlook|icloud|aol)\.com$/.test(domain)) {
+      const root = domain.replace(/\.(com|net|org|co|io|us|biz)$/i, "");
+      return root.replace(/[-_.]+/g, " ").trim();
+    }
+  }
+
+  return "";
+}
+
+function isGenericEmployerLabel(name) {
+  const normalized = normalizeCompanyName(name);
+  const genericOnly = ["employer", "company", "business", "payroll", "hr", "human resources"];
+  return genericOnly.includes(normalized) || normalized.length < 4;
+}
+
+function looksSyntheticEmployerName(name) {
+  const cleaned = name.trim();
+  const hasEntitySuffix = /\b(inc|llc|ltd|corp|corporation|co|company)\b/i.test(cleaned);
+  const hasManyDigits = (cleaned.match(/\d/g) || []).length >= 4;
+  const weirdRepeats = /(.)\1\1/i.test(cleaned);
+  return !hasEntitySuffix && (hasManyDigits || weirdRepeats);
+}
+
+async function evaluateEmployerPresence(name) {
+  const query = encodeURIComponent(`"${name}" company`);
+  const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${query}&srlimit=5&format=json&origin=*`;
+  const payload = await fetchJsonWithTimeout(url, 6500);
+  const searchResults = payload?.query?.search || [];
+
+  if (!searchResults.length) {
+    return { status: "not_found", score: 0 };
+  }
+
+  const employerTokens = tokenizeCompanyName(name);
+  let bestScore = 0;
+  for (const result of searchResults) {
+    const titleTokens = tokenizeCompanyName(result.title || "");
+    const overlap = tokenOverlapRatio(employerTokens, titleTokens);
+    if (overlap > bestScore) {
+      bestScore = overlap;
+    }
+  }
+
+  if (bestScore >= 0.6) {
+    return { status: "found", score: bestScore };
+  }
+  if (bestScore >= 0.35 || searchResults.length >= 4) {
+    return { status: "weak_match", score: bestScore };
+  }
+  return { status: "not_found", score: bestScore };
+}
+
+function normalizeCompanyName(value) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\b(inc|llc|ltd|corp|corporation|co|company|the)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeCompanyName(value) {
+  const normalized = normalizeCompanyName(value);
+  if (!normalized) {
+    return [];
+  }
+  return normalized.split(" ").filter(Boolean);
+}
+
+function tokenOverlapRatio(aTokens, bTokens) {
+  if (!aTokens.length || !bTokens.length) {
+    return 0;
+  }
+  const bSet = new Set(bTokens);
+  let overlap = 0;
+  for (const token of new Set(aTokens)) {
+    if (bSet.has(token)) {
+      overlap += 1;
+    }
+  }
+  return overlap / Math.max(1, new Set(aTokens).size);
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function findIdAuthenticityClues(text, profile, existingCoreFields) {
