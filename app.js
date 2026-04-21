@@ -601,7 +601,7 @@ function findBankStatementMathClues(text, profile) {
     const expectedCents = toCents(opening) + toCents(deposits) - toCents(withdrawals);
     const closingCents = toCents(closing);
     const deltaCents = Math.abs(expectedCents - closingCents);
-    if (deltaCents >= 2) {
+    if (deltaCents > 0) {
       clues.push({
         type: "Bank math mismatch",
         title: "Balances do not reconcile (opening + deposits - withdrawals != ending)",
@@ -768,7 +768,7 @@ function evaluateRunningBalanceStep(previousBalance, row) {
       bestDeltaCents = deltaCents;
     }
   }
-  const toleranceCents = row.amountInfo.signKnown ? 1 : 2;
+  const toleranceCents = 0;
   return {
     deltaCents: bestDeltaCents,
     toleranceCents,
@@ -789,14 +789,16 @@ function findPayStubMathClues(text, profile) {
   const rate = getPrimaryAmountByKeywords(text, ["hourly rate", "rate"]);
 
   if ([gross, net, deductions].every((n) => Number.isFinite(n))) {
-    const expectedNet = gross - deductions;
-    const delta = Math.abs(expectedNet - net);
-    const tolerance = Math.max(0.75, Math.abs(gross) * 0.01);
-    if (delta > tolerance) {
+    const expectedNetCents = toCents(gross) - toCents(deductions);
+    const netCents = toCents(net);
+    const deltaCents = Math.abs(expectedNetCents - netCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Pay math mismatch",
         title: "Gross pay minus deductions does not match net pay",
-        snippet: `Gross ${toMoney(gross)}, deductions ${toMoney(deductions)}, net ${toMoney(net)}.`,
+        snippet: `Gross ${toMoney(gross)}, deductions ${toMoney(deductions)}, net ${toMoney(net)}, mismatch ${toMoney(
+          deltaCents / 100
+        )}.`,
         rawMatch: `net pay ${toMoney(net)}`,
         weight: 10,
         confidence: 0.95,
@@ -818,13 +820,14 @@ function findPayStubMathClues(text, profile) {
 
   if (Number.isFinite(hours) && Number.isFinite(rate) && Number.isFinite(gross)) {
     const expectedGross = hours * rate;
-    const delta = Math.abs(expectedGross - gross);
-    const tolerance = Math.max(2.0, expectedGross * 0.03);
-    if (delta > tolerance) {
+    const expectedGrossCents = toCents(expectedGross);
+    const grossCents = toCents(gross);
+    const deltaCents = Math.abs(expectedGrossCents - grossCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Pay math mismatch",
         title: "Hours x hourly rate does not align with gross pay",
-        snippet: `Hours ${hours}, rate ${toMoney(rate)}, gross ${toMoney(gross)}.`,
+        snippet: `Hours ${hours}, rate ${toMoney(rate)}, gross ${toMoney(gross)}, mismatch ${toMoney(deltaCents / 100)}.`,
         weight: 8,
         confidence: 0.8,
       });
@@ -870,13 +873,16 @@ function findPayStubLineItemClues(text, profile) {
 
   if (Number.isFinite(deductionTotal) && deductionItems.length >= 2) {
     const deducedTotal = deductionItems.reduce((sum, item) => sum + item.value, 0);
-    const delta = Math.abs(deducedTotal - deductionTotal);
-    const tolerance = Math.max(1.0, deductionTotal * 0.03);
-    if (delta > tolerance) {
+    const deducedTotalCents = toCents(deducedTotal);
+    const deductionTotalCents = toCents(deductionTotal);
+    const deltaCents = Math.abs(deducedTotalCents - deductionTotalCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Pay math mismatch",
         title: "Deduction line items do not add up to total deductions",
-        snippet: `Line items ${toMoney(deducedTotal)} vs total deductions ${toMoney(deductionTotal)}.`,
+        snippet: `Line items ${toMoney(deducedTotal)} vs total deductions ${toMoney(deductionTotal)}, mismatch ${toMoney(
+          deltaCents / 100
+        )}.`,
         rawMatch: deductionItems[0].raw,
         weight: 9,
         confidence: 0.9,
@@ -897,13 +903,16 @@ function findPayStubLineItemClues(text, profile) {
 
   if (Number.isFinite(gross) && earningItems.length >= 2) {
     const summedEarnings = earningItems.reduce((sum, item) => sum + item.value, 0);
-    const delta = Math.abs(summedEarnings - gross);
-    const tolerance = Math.max(1.25, gross * 0.03);
-    if (delta > tolerance) {
+    const summedEarningsCents = toCents(summedEarnings);
+    const grossCents = toCents(gross);
+    const deltaCents = Math.abs(summedEarningsCents - grossCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Pay math mismatch",
         title: "Earning components do not add up to gross pay",
-        snippet: `Line items ${toMoney(summedEarnings)} vs gross pay ${toMoney(gross)}.`,
+        snippet: `Line items ${toMoney(summedEarnings)} vs gross pay ${toMoney(gross)}, mismatch ${toMoney(
+          deltaCents / 100
+        )}.`,
         rawMatch: earningItems[0].raw,
         weight: 8,
         confidence: 0.86,
