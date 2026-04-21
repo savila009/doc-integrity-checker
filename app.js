@@ -10,6 +10,7 @@ const riskScoreEl = document.getElementById("riskScore");
 const totalFlagsEl = document.getElementById("totalFlags");
 const textLengthEl = document.getElementById("textLength");
 const analysisSummaryEl = document.getElementById("analysisSummary");
+const diagnosticsPanelEl = document.getElementById("diagnosticsPanel");
 const issuesList = document.getElementById("issuesList");
 const documentPreviewEl = document.getElementById("documentPreview");
 
@@ -171,6 +172,16 @@ async function extractFromImage(file, selectedType, scanMode) {
 
   return {
     text: normalizeText(bestResult.text),
+    analysisMeta: {
+      textSourceDetails: [
+        {
+          pageNumber: 1,
+          source: "ocr",
+          nativeLength: 0,
+          ocrLength: (bestResult.text || "").length,
+        },
+      ],
+    },
     pages: [
       {
         pageNumber: 1,
@@ -188,6 +199,7 @@ async function extractFromPdf(file, selectedType, scanMode) {
   const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
   const pages = [];
   let textParts = [];
+  const textSourceDetails = [];
 
   for (let pageIndex = 1; pageIndex <= pdf.numPages; pageIndex += 1) {
     setStatus(`Rendering PDF page ${pageIndex}/${pdf.numPages}...`);
@@ -208,7 +220,14 @@ async function extractFromPdf(file, selectedType, scanMode) {
       scanMode
     );
 
-    textParts.push(selectPdfAnalysisText(nativeText, bestResult.text));
+    const selected = selectPdfAnalysisText(nativeText, bestResult.text);
+    textParts.push(selected.text);
+    textSourceDetails.push({
+      pageNumber: pageIndex,
+      source: selected.source,
+      nativeLength: selected.nativeLength,
+      ocrLength: selected.ocrLength,
+    });
     pages.push({
       pageNumber: pageIndex,
       imageUrl: canvas.toDataURL("image/png"),
@@ -220,6 +239,9 @@ async function extractFromPdf(file, selectedType, scanMode) {
 
   return {
     text: normalizeText(textParts.join(" ")),
+    analysisMeta: {
+      textSourceDetails,
+    },
     pages,
   };
 }
@@ -245,9 +267,19 @@ function selectPdfAnalysisText(nativeText, ocrText) {
   const nativeNormalized = normalizeText(nativeText || "");
   const ocrNormalized = normalizeText(ocrText || "");
   if (isUsableNativePdfText(nativeNormalized, ocrNormalized)) {
-    return nativeNormalized;
+    return {
+      text: nativeNormalized,
+      source: "native",
+      nativeLength: nativeNormalized.length,
+      ocrLength: ocrNormalized.length,
+    };
   }
-  return ocrNormalized;
+  return {
+    text: ocrNormalized,
+    source: "ocr",
+    nativeLength: nativeNormalized.length,
+    ocrLength: ocrNormalized.length,
+  };
 }
 
 function isUsableNativePdfText(nativeText, ocrText) {
@@ -383,6 +415,7 @@ async function inspectDocument(extracted, selectedType, scanMode) {
   const text = extracted.text;
   const profile = detectDocumentProfile(text, selectedType);
   const summary = buildAnalysisSummary(extracted, profile);
+  const bankLineItemDiagnostics = {};
   let rawClues = [];
 
   if (profile.likelyId) {
@@ -396,7 +429,7 @@ async function inspectDocument(extracted, selectedType, scanMode) {
       ...findValueFormatSwitchClues(text),
       ...findAmountOutlierClues(text),
       ...findBankStatementMathClues(text, profile),
-      ...findBankLineItemTotalClues(text, profile),
+      ...findBankLineItemTotalClues(text, profile, bankLineItemDiagnostics),
       ...findBankRunningBalanceClues(text, profile),
       ...findPayStubMathClues(text, profile),
       ...findPayStubLineItemClues(text, profile),
@@ -430,6 +463,7 @@ async function inspectDocument(extracted, selectedType, scanMode) {
     pages: [],
     profile,
     summary,
+    diagnostics: buildReportDiagnostics(extracted, profile, bankLineItemDiagnostics),
     detectionConfidence: computeDetectionConfidence(extracted, profile, summary, scanMode),
   };
 }
@@ -684,7 +718,7 @@ function findBankStatementMathClues(text, profile) {
   return clues;
 }
 
-function findBankLineItemTotalClues(text, profile) {
+function findBankLineItemTotalClues(text, profile, diagnosticsOut = null) {
   if (!profile.likelyBankStatement) {
     return [];
   }
@@ -720,6 +754,8 @@ function findBankLineItemTotalClues(text, profile) {
   const unknownRows = rowRollup.unknownRows;
 
   const clues = [];
+  let depositDeltaCents = null;
+  let debitDeltaCents = null;
   if (Number.isFinite(declaredDeposits)) {
     if (depositsRollup.count === 0) {
       clues.push({
@@ -731,7 +767,7 @@ function findBankLineItemTotalClues(text, profile) {
         confidence: 0.7,
       });
     } else {
-      const depositDeltaCents = Math.abs(depositsRollup.cents - toCents(Math.abs(declaredDeposits)));
+      depositDeltaCents = Math.abs(depositsRollup.cents - toCents(Math.abs(declaredDeposits)));
       if (depositDeltaCents > 0) {
         clues.push({
           type: "Bank math mismatch",
@@ -758,7 +794,7 @@ function findBankLineItemTotalClues(text, profile) {
         confidence: 0.7,
       });
     } else {
-      const debitDeltaCents = Math.abs(debitsRollup.cents - toCents(Math.abs(declaredDebits)));
+      debitDeltaCents = Math.abs(debitsRollup.cents - toCents(Math.abs(declaredDebits)));
       if (debitDeltaCents > 0) {
         clues.push({
           type: "Bank math mismatch",
@@ -774,6 +810,17 @@ function findBankLineItemTotalClues(text, profile) {
         });
       }
     }
+  }
+
+  if (diagnosticsOut) {
+    diagnosticsOut.declaredDeposits = Number.isFinite(declaredDeposits) ? Math.abs(declaredDeposits) : null;
+    diagnosticsOut.declaredDebits = Number.isFinite(declaredDebits) ? Math.abs(declaredDebits) : null;
+    diagnosticsOut.sectionRollup = sectionRollup;
+    diagnosticsOut.rowRollup = rowRollup;
+    diagnosticsOut.selectedDepositsRollup = depositsRollup;
+    diagnosticsOut.selectedDebitsRollup = debitsRollup;
+    diagnosticsOut.depositDeltaCents = Number.isFinite(depositDeltaCents) ? depositDeltaCents : null;
+    diagnosticsOut.debitDeltaCents = Number.isFinite(debitDeltaCents) ? debitDeltaCents : null;
   }
 
   return clues;
@@ -2095,6 +2142,7 @@ function renderReport(report) {
   textLengthEl.textContent = String(report.textLength);
   renderAnalysisSummary(report.summary);
   renderDetectionConfidence(report.detectionConfidence);
+  renderDiagnostics(report.diagnostics);
 
   if (!report.clues.length) {
     issuesList.innerHTML =
@@ -2120,6 +2168,77 @@ function renderReport(report) {
 
   issuesList.innerHTML = items;
   renderDocumentPreview(report.pages);
+}
+
+function renderDiagnostics(diagnostics) {
+  if (!diagnosticsPanelEl) {
+    return;
+  }
+  if (!diagnostics) {
+    diagnosticsPanelEl.innerHTML = '<p class="empty">No diagnostics available.</p>';
+    return;
+  }
+
+  const lines = [];
+  lines.push(`Detected type: ${getDetectedTypeLabel(diagnostics.profile || {})}`);
+  lines.push(`Text source: ${diagnostics.textSourceSummary || "unknown"}`);
+
+  if (diagnostics.pageSources && diagnostics.pageSources.length) {
+    lines.push(`Page sources: ${diagnostics.pageSources.join(", ")}`);
+  }
+
+  if (diagnostics.bankLineItems) {
+    const bank = diagnostics.bankLineItems;
+    lines.push("");
+    lines.push("Bank line-item reconciliation:");
+    lines.push(`  Declared deposits: ${formatDiagnosticMoney(bank.declaredDeposits)}`);
+    lines.push(`  Declared debits: ${formatDiagnosticMoney(bank.declaredDebits)}`);
+    lines.push(
+      `  Section rollup deposits: count=${bank.sectionRollup?.depositCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.sectionRollup?.depositCents)
+      )}`
+    );
+    lines.push(
+      `  Section rollup debits: count=${bank.sectionRollup?.debitCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.sectionRollup?.debitCents)
+      )}`
+    );
+    lines.push(
+      `  Row rollup deposits: count=${bank.rowRollup?.depositCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.rowRollup?.depositCents)
+      )}`
+    );
+    lines.push(
+      `  Row rollup debits: count=${bank.rowRollup?.debitCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.rowRollup?.debitCents)
+      )}`
+    );
+    lines.push(`  Row unknown count: ${bank.rowRollup?.unknownRows ?? 0}`);
+    lines.push(
+      `  Selected deposits source: ${bank.selectedDepositsRollup?.source || "n/a"} (${bank.selectedDepositsRollup?.count || 0} rows)`
+    );
+    lines.push(
+      `  Selected debits source: ${bank.selectedDebitsRollup?.source || "n/a"} (${bank.selectedDebitsRollup?.count || 0} rows)`
+    );
+    lines.push(`  Deposit delta: ${formatDiagnosticMoney(centsToMoney(bank.depositDeltaCents))}`);
+    lines.push(`  Debit delta: ${formatDiagnosticMoney(centsToMoney(bank.debitDeltaCents))}`);
+  }
+
+  diagnosticsPanelEl.innerHTML = `<pre class="diagnostics-pre">${escapeHtml(lines.join("\n"))}</pre>`;
+}
+
+function centsToMoney(cents) {
+  if (!Number.isFinite(cents)) {
+    return NaN;
+  }
+  return cents / 100;
+}
+
+function formatDiagnosticMoney(value) {
+  if (!Number.isFinite(value)) {
+    return "Not found";
+  }
+  return `$${toMoney(value)}`;
 }
 
 function renderAnalysisSummary(summary) {
@@ -2260,6 +2379,30 @@ function computeDetectionConfidence(extracted, profile, summary, scanMode) {
   else if (score >= 60) level = "Medium";
 
   return { score, level };
+}
+
+function buildReportDiagnostics(extracted, profile, bankLineItemDiagnostics) {
+  const textSources = extracted?.analysisMeta?.textSourceDetails || [];
+  const nativeCount = textSources.filter((entry) => entry.source === "native").length;
+  const ocrCount = textSources.filter((entry) => entry.source === "ocr").length;
+  const pageSources = textSources.map((entry) => `p${entry.pageNumber}:${entry.source}`);
+
+  const textSourceSummary =
+    textSources.length === 0
+      ? "unknown"
+      : nativeCount > 0 && ocrCount === 0
+      ? "native"
+      : nativeCount === 0
+      ? "ocr"
+      : `mixed (native ${nativeCount}, ocr ${ocrCount})`;
+
+  return {
+    profile,
+    textSourceSummary,
+    pageSources,
+    bankLineItems:
+      bankLineItemDiagnostics && Object.keys(bankLineItemDiagnostics).length ? bankLineItemDiagnostics : null,
+  };
 }
 
 function attachHighlights(report, pages) {
