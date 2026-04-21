@@ -652,70 +652,222 @@ function findBankLineItemTotalClues(text, profile) {
     return [];
   }
 
-  const rows = extractBankTransactionRows(text);
-  if (rows.length < 2) {
-    return [];
-  }
-
   const opening = getPrimaryAmountByKeywords(text, ["beginning balance", "opening balance", "starting balance"]);
-  const declaredDeposits = getPrimaryAmountByKeywords(text, ["total deposits", "deposits total", "total credits"]);
-  const declaredDebits = getPrimaryAmountByKeywords(text, ["total withdrawals", "withdrawals total", "total debits", "debits total"]);
+  const declaredDeposits =
+    extractDeclaredBankTotal(text, "deposits") ||
+    getPrimaryAmountByKeywords(text, ["total deposits", "deposits total", "total credits", "electronic deposits", "plus deposits"]);
+  const declaredDebits =
+    extractDeclaredBankTotal(text, "withdrawals") ||
+    getPrimaryAmountByKeywords(text, [
+      "total withdrawals",
+      "withdrawals total",
+      "total debits",
+      "debits total",
+      "electronic withdrawals",
+      "less withdrawals",
+    ]);
   if (!Number.isFinite(declaredDeposits) && !Number.isFinite(declaredDebits)) {
     return [];
   }
 
-  let computedDepositCents = 0;
-  let computedDebitCents = 0;
+  const sectionRollup = summarizeBankSectionLineItems(text);
+  const rowRollup = summarizeBankRowLineItems(text, opening);
+  const depositsRollup =
+    rowRollup.depositCount > sectionRollup.depositCount
+      ? { cents: rowRollup.depositCents, count: rowRollup.depositCount, source: "row-balance" }
+      : { cents: sectionRollup.depositCents, count: sectionRollup.depositCount, source: "section-list" };
+  const debitsRollup =
+    rowRollup.debitCount > sectionRollup.debitCount
+      ? { cents: rowRollup.debitCents, count: rowRollup.debitCount, source: "row-balance" }
+      : { cents: sectionRollup.debitCents, count: sectionRollup.debitCount, source: "section-list" };
+  const unknownRows = rowRollup.unknownRows;
+
+  const clues = [];
+  if (Number.isFinite(declaredDeposits)) {
+    if (depositsRollup.count === 0) {
+      clues.push({
+        type: "Bank anomaly",
+        title: "Could not parse individual deposit line items",
+        snippet: "Total deposits present, but transaction rows were not parseable for deposit rollup.",
+        rawMatch: "total deposits",
+        weight: 0,
+        confidence: 0.7,
+      });
+    } else {
+      const depositDeltaCents = Math.abs(depositsRollup.cents - toCents(Math.abs(declaredDeposits)));
+      if (depositDeltaCents > 0) {
+        clues.push({
+          type: "Bank math mismatch",
+          title: "Individual deposits do not add up to total deposits",
+          snippet: `Parsed ${depositsRollup.count} deposits (${depositsRollup.source}) totaling ${toMoney(
+            depositsRollup.cents / 100
+          )} vs total deposits ${toMoney(Math.abs(declaredDeposits))}, mismatch ${toMoney(depositDeltaCents / 100)}.`,
+          rawMatch: "total deposits",
+          weight: 10,
+          confidence: depositsRollup.source === "section-list" ? 0.95 : 0.88,
+        });
+      }
+    }
+  }
+
+  if (Number.isFinite(declaredDebits)) {
+    if (debitsRollup.count === 0) {
+      clues.push({
+        type: "Bank anomaly",
+        title: "Could not parse individual debit line items",
+        snippet: "Total debits/withdrawals present, but transaction rows were not parseable for debit rollup.",
+        rawMatch: "total debits",
+        weight: 0,
+        confidence: 0.7,
+      });
+    } else {
+      const debitDeltaCents = Math.abs(debitsRollup.cents - toCents(Math.abs(declaredDebits)));
+      if (debitDeltaCents > 0) {
+        clues.push({
+          type: "Bank math mismatch",
+          title: "Individual debits do not add up to total debits/withdrawals",
+          snippet: `Parsed ${debitsRollup.count} debits (${debitsRollup.source}) totaling ${toMoney(
+            debitsRollup.cents / 100
+          )} vs total debits ${toMoney(Math.abs(declaredDebits))}, mismatch ${toMoney(
+            debitDeltaCents / 100
+          )}. Unknown rows: ${unknownRows}.`,
+          rawMatch: "total debits",
+          weight: 10,
+          confidence: debitsRollup.source === "section-list" ? 0.95 : 0.88,
+        });
+      }
+    }
+  }
+
+  return clues;
+}
+
+function summarizeBankRowLineItems(text, openingBalance) {
+  const rows = extractBankTransactionRows(text);
+  if (!rows.length) {
+    return {
+      depositCents: 0,
+      debitCents: 0,
+      depositCount: 0,
+      debitCount: 0,
+      unknownRows: 0,
+    };
+  }
+
+  let depositCents = 0;
+  let debitCents = 0;
+  let depositCount = 0;
+  let debitCount = 0;
   let unknownRows = 0;
 
   for (let i = 0; i < rows.length; i += 1) {
-    const previousBalance = i === 0 ? opening : rows[i - 1].balance;
+    const previousBalance = i === 0 ? openingBalance : rows[i - 1].balance;
     const signedAmountCents = resolveRowSignedAmountCents(rows[i], previousBalance);
     if (!Number.isFinite(signedAmountCents) || signedAmountCents === 0) {
       unknownRows += 1;
       continue;
     }
     if (signedAmountCents > 0) {
-      computedDepositCents += signedAmountCents;
+      depositCents += signedAmountCents;
+      depositCount += 1;
     } else {
-      computedDebitCents += Math.abs(signedAmountCents);
+      debitCents += Math.abs(signedAmountCents);
+      debitCount += 1;
     }
   }
 
-  const clues = [];
-  if (Number.isFinite(declaredDeposits)) {
-    const depositDeltaCents = Math.abs(computedDepositCents - toCents(declaredDeposits));
-    if (depositDeltaCents > 0) {
-      clues.push({
-        type: "Bank math mismatch",
-        title: "Individual deposits do not add up to total deposits",
-        snippet: `Line-item deposits ${toMoney(computedDepositCents / 100)} vs total deposits ${toMoney(
-          declaredDeposits
-        )}, mismatch ${toMoney(depositDeltaCents / 100)}. Unknown rows: ${unknownRows}.`,
-        rawMatch: "total deposits",
-        weight: 10,
-        confidence: unknownRows === 0 ? 0.95 : 0.82,
-      });
+  return {
+    depositCents,
+    debitCents,
+    depositCount,
+    debitCount,
+    unknownRows,
+  };
+}
+
+function summarizeBankSectionLineItems(text) {
+  const depositsSection = extractTextWindow(
+    text,
+    ["electronic deposits this statement period", "deposits this statement period", "deposits this period"],
+    ["total electronic deposits", "electronic withdrawals this statement period", "withdrawals this statement period"]
+  );
+  const withdrawalsSection = extractTextWindow(
+    text,
+    ["electronic withdrawals this statement period", "withdrawals this statement period"],
+    ["total electronic withdrawals", "lowest daily balance"]
+  );
+  const depositAmounts = parseBankSectionAmounts(depositsSection);
+  const withdrawalAmounts = parseBankSectionAmounts(withdrawalsSection);
+
+  return {
+    depositCents: depositAmounts.reduce((sum, amount) => sum + Math.abs(toCents(amount)), 0),
+    debitCents: withdrawalAmounts.reduce((sum, amount) => sum + Math.abs(toCents(amount)), 0),
+    depositCount: depositAmounts.length,
+    debitCount: withdrawalAmounts.length,
+  };
+}
+
+function extractTextWindow(text, startMarkers, endMarkers) {
+  const lower = text.toLowerCase();
+  let startIndex = -1;
+  for (const marker of startMarkers) {
+    const idx = lower.indexOf(marker.toLowerCase());
+    if (idx !== -1 && (startIndex === -1 || idx < startIndex)) {
+      startIndex = idx;
     }
   }
-
-  if (Number.isFinite(declaredDebits)) {
-    const debitDeltaCents = Math.abs(computedDebitCents - toCents(declaredDebits));
-    if (debitDeltaCents > 0) {
-      clues.push({
-        type: "Bank math mismatch",
-        title: "Individual debits do not add up to total debits/withdrawals",
-        snippet: `Line-item debits ${toMoney(computedDebitCents / 100)} vs total debits ${toMoney(
-          declaredDebits
-        )}, mismatch ${toMoney(debitDeltaCents / 100)}. Unknown rows: ${unknownRows}.`,
-        rawMatch: "total debits",
-        weight: 10,
-        confidence: unknownRows === 0 ? 0.95 : 0.82,
-      });
-    }
+  if (startIndex === -1) {
+    return "";
   }
 
-  return clues;
+  let endIndex = text.length;
+  for (const marker of endMarkers) {
+    const idx = lower.indexOf(marker.toLowerCase(), startIndex + 1);
+    if (idx !== -1 && idx < endIndex) {
+      endIndex = idx;
+    }
+  }
+  return text.slice(startIndex, endIndex);
+}
+
+function parseBankSectionAmounts(sectionText) {
+  if (!sectionText) {
+    return [];
+  }
+  const sanitized = sectionText.replace(/[−–—]/g, "-");
+  const regex =
+    /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\s+(-?\$?\d{1,3}(?:,\d{3})*\.\d{2})\b/gi;
+  const values = [];
+  for (const match of sanitized.matchAll(regex)) {
+    const parsed = parseLooseMoneyAmount(match[1]);
+    if (Number.isFinite(parsed) && parsed !== 0) {
+      values.push(parsed);
+    }
+  }
+  return values;
+}
+
+function extractDeclaredBankTotal(text, kind) {
+  const patternList =
+    kind === "deposits"
+      ? [
+          /total(?:\s+[a-z()]+){0,6}\s+deposits?[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
+          /plus\s+deposits?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
+        ]
+      : [
+          /total(?:\s+[a-z()]+){0,6}\s+(?:withdrawals?|debits?)[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
+          /less\s+withdrawals?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\$|\$-?)?\d{1,3}(?:,\d{3})*\.\d{2})/gi,
+        ];
+
+  for (const pattern of patternList) {
+    for (const match of text.matchAll(pattern)) {
+      const parsed = parseLooseMoneyAmount(match[1]);
+      if (Number.isFinite(parsed)) {
+        return Math.abs(parsed);
+      }
+    }
+  }
+  return NaN;
 }
 
 function findBankRunningBalanceClues(text, profile) {
@@ -1518,6 +1670,23 @@ function parseMoney(value) {
   }
   const parsed = Number(value.replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function parseLooseMoneyAmount(value) {
+  if (!value) {
+    return NaN;
+  }
+  const normalized = String(value).trim().replace(/,/g, "");
+  const sign = /-\$|\(-?\$|-/.test(normalized) ? -1 : 1;
+  const numericPart = normalized.replace(/[^0-9.]/g, "");
+  if (!numericPart || !/^\d+(?:\.\d{1,2})?$/.test(numericPart)) {
+    return NaN;
+  }
+  const parsed = Number(numericPart);
+  if (!Number.isFinite(parsed)) {
+    return NaN;
+  }
+  return sign * parsed;
 }
 
 function toCents(value) {
