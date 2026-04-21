@@ -598,14 +598,16 @@ function findBankStatementMathClues(text, profile) {
   const period = extractStatementPeriod(text);
 
   if ([opening, deposits, withdrawals, closing].every((n) => Number.isFinite(n))) {
-    const expected = opening + deposits - withdrawals;
-    const delta = Math.abs(expected - closing);
-    const tolerance = Math.max(1.0, Math.abs(expected) * 0.01);
-    if (delta > tolerance) {
+    const expectedCents = toCents(opening) + toCents(deposits) - toCents(withdrawals);
+    const closingCents = toCents(closing);
+    const deltaCents = Math.abs(expectedCents - closingCents);
+    if (deltaCents >= 2) {
       clues.push({
         type: "Bank math mismatch",
         title: "Balances do not reconcile (opening + deposits - withdrawals != ending)",
-        snippet: `Opening ${toMoney(opening)}, deposits ${toMoney(deposits)}, withdrawals ${toMoney(withdrawals)}, ending ${toMoney(closing)}.`,
+        snippet: `Opening ${toMoney(opening)}, deposits ${toMoney(deposits)}, withdrawals ${toMoney(withdrawals)}, ending ${toMoney(
+          closing
+        )}, mismatch ${toMoney(deltaCents / 100)}.`,
         rawMatch: `ending balance ${toMoney(closing)}`,
         weight: 10,
         confidence: 0.95,
@@ -660,7 +662,7 @@ function findBankRunningBalanceClues(text, profile) {
   if (Number.isFinite(opening)) {
     const firstRow = rows[0];
     const firstEval = evaluateRunningBalanceStep(opening, firstRow);
-    if (!firstEval.withinTolerance && firstEval.delta > 1) {
+    if (!firstEval.withinTolerance) {
       clues.push({
         type: "Bank math mismatch",
         title: "First transaction does not reconcile with opening balance",
@@ -676,7 +678,7 @@ function findBankRunningBalanceClues(text, profile) {
     const prev = rows[i - 1];
     const curr = rows[i];
     const evaluation = evaluateRunningBalanceStep(prev.balance, curr);
-    if (!evaluation.withinTolerance && evaluation.delta > 1.25) {
+    if (!evaluation.withinTolerance) {
       clues.push({
         type: "Bank math mismatch",
         title: "Transaction amount does not reconcile with running balance",
@@ -756,19 +758,21 @@ function evaluateRunningBalanceStep(previousBalance, row) {
     candidateAmounts = [row.amountInfo.absolute, -row.amountInfo.absolute];
   }
 
-  let bestDelta = Number.POSITIVE_INFINITY;
+  const previousCents = toCents(previousBalance);
+  const rowBalanceCents = toCents(row.balance);
+  let bestDeltaCents = Number.POSITIVE_INFINITY;
   for (const amount of candidateAmounts) {
-    const expected = previousBalance + amount;
-    const delta = Math.abs(expected - row.balance);
-    if (delta < bestDelta) {
-      bestDelta = delta;
+    const expectedCents = previousCents + toCents(amount);
+    const deltaCents = Math.abs(expectedCents - rowBalanceCents);
+    if (deltaCents < bestDeltaCents) {
+      bestDeltaCents = deltaCents;
     }
   }
-  const tolerance = Math.max(0.75, row.amountInfo.absolute * 0.015);
+  const toleranceCents = row.amountInfo.signKnown ? 1 : 2;
   return {
-    delta: bestDelta,
-    tolerance,
-    withinTolerance: bestDelta <= tolerance,
+    deltaCents: bestDeltaCents,
+    toleranceCents,
+    withinTolerance: bestDeltaCents <= toleranceCents,
   };
 }
 
@@ -1400,6 +1404,13 @@ function parseMoney(value) {
   }
   const parsed = Number(value.replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function toCents(value) {
+  if (!Number.isFinite(value)) {
+    return NaN;
+  }
+  return Math.round((value + Number.EPSILON) * 100);
 }
 
 function toMoney(value) {
