@@ -439,6 +439,9 @@ async function inspectDocument(extracted, selectedType, scanMode) {
     rawClues.push(...externalClues);
   }
 
+  const bankCoverageClues = findBankCoverageDiagnosticsClues(profile, bankLineItemDiagnostics);
+  rawClues.push(...bankCoverageClues);
+
   const clues = rawClues.map((clue, index) => ({
     confidence: 0.6,
     ...clue,
@@ -821,6 +824,62 @@ function findBankLineItemTotalClues(text, profile, diagnosticsOut = null) {
     diagnosticsOut.selectedDebitsRollup = debitsRollup;
     diagnosticsOut.depositDeltaCents = Number.isFinite(depositDeltaCents) ? depositDeltaCents : null;
     diagnosticsOut.debitDeltaCents = Number.isFinite(debitDeltaCents) ? debitDeltaCents : null;
+  }
+
+  return clues;
+}
+
+function findBankCoverageDiagnosticsClues(profile, bankDiagnostics) {
+  if (!profile?.likelyBankStatement || !bankDiagnostics) {
+    return [];
+  }
+
+  const declaredDepositsPresent = Number.isFinite(bankDiagnostics.declaredDeposits);
+  const declaredDebitsPresent = Number.isFinite(bankDiagnostics.declaredDebits);
+  if (!declaredDepositsPresent && !declaredDebitsPresent) {
+    return [];
+  }
+
+  const selectedDepositsCount = bankDiagnostics.selectedDepositsRollup?.count || 0;
+  const selectedDebitsCount = bankDiagnostics.selectedDebitsRollup?.count || 0;
+  const selectedTotal = selectedDepositsCount + selectedDebitsCount;
+  const unknownRows = bankDiagnostics.rowRollup?.unknownRows || 0;
+  const unknownRatio = selectedTotal > 0 ? unknownRows / (selectedTotal + unknownRows) : 1;
+
+  const clues = [];
+  if (selectedTotal < 6) {
+    clues.push({
+      type: "Bank anomaly",
+      title: "Too few transaction lines were parsed for reliable reconciliation",
+      snippet: `Parsed ${selectedTotal} signed rows (deposits ${selectedDepositsCount}, debits ${selectedDebitsCount}).`,
+      weight: 7,
+      confidence: 0.9,
+    });
+  }
+
+  if (unknownRows >= 4 || unknownRatio >= 0.35) {
+    clues.push({
+      type: "Bank anomaly",
+      title: "High number of unclassified bank rows limits trust in totals",
+      snippet: `Unknown rows ${unknownRows}, unknown ratio ${(unknownRatio * 100).toFixed(1)}%.`,
+      weight: 8,
+      confidence: 0.9,
+    });
+  }
+
+  if (
+    declaredDepositsPresent &&
+    selectedDepositsCount > 0 &&
+    selectedDebitsCount > 0 &&
+    selectedDepositsCount === selectedDebitsCount
+  ) {
+    clues.push({
+      type: "Bank anomaly",
+      title: "Deposit and debit counts are suspiciously symmetric",
+      snippet: `Detected ${selectedDepositsCount} deposits and ${selectedDebitsCount} debits in selected rollup.`,
+      weight: 4,
+      confidence: 0.78,
+    });
   }
 
   return clues;
