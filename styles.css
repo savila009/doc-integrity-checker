@@ -259,6 +259,34 @@ button:disabled {
   margin-bottom: 1rem;
 }
 
+.debug-card {
+  margin-top: 0.8rem;
+  padding: 0.8rem;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+}
+
+.debug-card h4 {
+  margin: 0 0 0.5rem;
+  color: #92400e;
+}
+
+.debug-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem 1rem;
+}
+
+.debug-item {
+  font-size: 0.88rem;
+}
+
+.debug-key {
+  color: #78350f;
+  margin-right: 0.35rem;
+  font-weight: 600;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

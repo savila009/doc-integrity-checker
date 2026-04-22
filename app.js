@@ -10,6 +10,7 @@ const riskScoreEl = document.getElementById("riskScore");
 const totalFlagsEl = document.getElementById("totalFlags");
 const textLengthEl = document.getElementById("textLength");
 const analysisSummaryEl = document.getElementById("analysisSummary");
+const diagnosticsPanelEl = document.getElementById("diagnosticsPanel");
 const issuesList = document.getElementById("issuesList");
 const documentPreviewEl = document.getElementById("documentPreview");
 
@@ -34,7 +35,7 @@ analyzeBtn.addEventListener("click", async () => {
     const extracted = await extractDocumentData(file, selectedType, scanMode);
 
     setStatus("Analyzing for suspicious edit clues...");
-    const report = inspectDocument(extracted, selectedType, scanMode);
+    const report = await inspectDocument(extracted, selectedType, scanMode);
     const withHighlights = attachHighlights(report, extracted.pages);
     renderReport(withHighlights);
     syncDetectedTypeSelector(withHighlights.profile);
@@ -171,6 +172,16 @@ async function extractFromImage(file, selectedType, scanMode) {
 
   return {
     text: normalizeText(bestResult.text),
+    analysisMeta: {
+      textSourceDetails: [
+        {
+          pageNumber: 1,
+          source: "ocr",
+          nativeLength: 0,
+          ocrLength: (bestResult.text || "").length,
+        },
+      ],
+    },
     pages: [
       {
         pageNumber: 1,
@@ -188,6 +199,7 @@ async function extractFromPdf(file, selectedType, scanMode) {
   const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
   const pages = [];
   let textParts = [];
+  const textSourceDetails = [];
 
   for (let pageIndex = 1; pageIndex <= pdf.numPages; pageIndex += 1) {
     setStatus(`Rendering PDF page ${pageIndex}/${pdf.numPages}...`);
@@ -199,6 +211,7 @@ async function extractFromPdf(file, selectedType, scanMode) {
     canvas.height = viewport.height;
     const context = canvas.getContext("2d");
     await page.render({ canvasContext: context, viewport }).promise;
+    const nativeText = await extractNativePdfPageText(page);
 
     const bestResult = await runOcrWithOptionalIdEnhancement(
       canvas,
@@ -207,7 +220,14 @@ async function extractFromPdf(file, selectedType, scanMode) {
       scanMode
     );
 
-    textParts.push(bestResult.text);
+    const selected = selectPdfAnalysisText(nativeText, bestResult.text);
+    textParts.push(selected.text);
+    textSourceDetails.push({
+      pageNumber: pageIndex,
+      source: selected.source,
+      nativeLength: selected.nativeLength,
+      ocrLength: selected.ocrLength,
+    });
     pages.push({
       pageNumber: pageIndex,
       imageUrl: canvas.toDataURL("image/png"),
@@ -219,12 +239,61 @@ async function extractFromPdf(file, selectedType, scanMode) {
 
   return {
     text: normalizeText(textParts.join(" ")),
+    analysisMeta: {
+      textSourceDetails,
+    },
     pages,
   };
 }
 
 function normalizeText(text) {
   return text.replace(/\s+/g, " ").trim();
+}
+
+async function extractNativePdfPageText(page) {
+  try {
+    const textContent = await page.getTextContent();
+    const items = textContent?.items || [];
+    const chunks = items
+      .map((item) => (typeof item.str === "string" ? item.str : ""))
+      .filter(Boolean);
+    return normalizeText(chunks.join(" "));
+  } catch (error) {
+    return "";
+  }
+}
+
+function selectPdfAnalysisText(nativeText, ocrText) {
+  const nativeNormalized = normalizeText(nativeText || "");
+  const ocrNormalized = normalizeText(ocrText || "");
+  if (isUsableNativePdfText(nativeNormalized, ocrNormalized)) {
+    return {
+      text: nativeNormalized,
+      source: "native",
+      nativeLength: nativeNormalized.length,
+      ocrLength: ocrNormalized.length,
+    };
+  }
+  return {
+    text: ocrNormalized,
+    source: "ocr",
+    nativeLength: nativeNormalized.length,
+    ocrLength: ocrNormalized.length,
+  };
+}
+
+function isUsableNativePdfText(nativeText, ocrText) {
+  if (!nativeText) {
+    return false;
+  }
+  const tokenCount = (nativeText.match(/[A-Za-z0-9]{2,}/g) || []).length;
+  if (tokenCount < 8) {
+    return false;
+  }
+  if (nativeText.length >= Math.max(80, ocrText.length * 0.35)) {
+    return true;
+  }
+  return /\$\s*-?\d/.test(nativeText) || /\b(total|balance|deposit|withdrawal|payroll)\b/i.test(nativeText);
 }
 
 function normalizeOcrWords(words) {
@@ -342,10 +411,11 @@ function scoreIdExtractionQuality(text) {
   return score;
 }
 
-function inspectDocument(extracted, selectedType, scanMode) {
+async function inspectDocument(extracted, selectedType, scanMode) {
   const text = extracted.text;
   const profile = detectDocumentProfile(text, selectedType);
   const summary = buildAnalysisSummary(extracted, profile);
+  const bankLineItemDiagnostics = {};
   let rawClues = [];
 
   if (profile.likelyId) {
@@ -359,10 +429,18 @@ function inspectDocument(extracted, selectedType, scanMode) {
       ...findValueFormatSwitchClues(text),
       ...findAmountOutlierClues(text),
       ...findBankStatementMathClues(text, profile),
+      ...findBankLineItemTotalClues(text, profile, bankLineItemDiagnostics),
+      ...findBankRunningBalanceClues(text, profile),
       ...findPayStubMathClues(text, profile),
+      ...findPayStubLineItemClues(text, profile),
       ...findEmployerLegitimacyClues(text, profile),
     ];
+    const externalClues = await findExternalEmployerVerificationClues(text, profile);
+    rawClues.push(...externalClues);
   }
+
+  const bankCoverageClues = findBankCoverageDiagnosticsClues(profile, bankLineItemDiagnostics);
+  rawClues.push(...bankCoverageClues);
 
   const clues = rawClues.map((clue, index) => ({
     confidence: 0.6,
@@ -388,6 +466,7 @@ function inspectDocument(extracted, selectedType, scanMode) {
     pages: [],
     profile,
     summary,
+    diagnostics: buildReportDiagnostics(extracted, profile, bankLineItemDiagnostics),
     detectionConfidence: computeDetectionConfidence(extracted, profile, summary, scanMode),
   };
 }
@@ -594,14 +673,16 @@ function findBankStatementMathClues(text, profile) {
   const period = extractStatementPeriod(text);
 
   if ([opening, deposits, withdrawals, closing].every((n) => Number.isFinite(n))) {
-    const expected = opening + deposits - withdrawals;
-    const delta = Math.abs(expected - closing);
-    const tolerance = Math.max(1.0, Math.abs(expected) * 0.01);
-    if (delta > tolerance) {
+    const expectedCents = toCents(opening) + toCents(deposits) - toCents(withdrawals);
+    const closingCents = toCents(closing);
+    const deltaCents = Math.abs(expectedCents - closingCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Bank math mismatch",
         title: "Balances do not reconcile (opening + deposits - withdrawals != ending)",
-        snippet: `Opening ${toMoney(opening)}, deposits ${toMoney(deposits)}, withdrawals ${toMoney(withdrawals)}, ending ${toMoney(closing)}.`,
+        snippet: `Opening ${toMoney(opening)}, deposits ${toMoney(deposits)}, withdrawals ${toMoney(withdrawals)}, ending ${toMoney(
+          closing
+        )}, mismatch ${toMoney(deltaCents / 100)}.`,
         rawMatch: `ending balance ${toMoney(closing)}`,
         weight: 10,
         confidence: 0.95,
@@ -640,6 +721,461 @@ function findBankStatementMathClues(text, profile) {
   return clues;
 }
 
+function findBankLineItemTotalClues(text, profile, diagnosticsOut = null) {
+  if (!profile.likelyBankStatement) {
+    return [];
+  }
+
+  const opening = getPrimaryAmountByKeywords(text, ["beginning balance", "opening balance", "starting balance"]);
+  const declaredDeposits =
+    extractDeclaredBankTotal(text, "deposits") ||
+    getPrimaryAmountByKeywords(text, ["total deposits", "deposits total", "total credits", "electronic deposits", "plus deposits"]);
+  const declaredDebits =
+    extractDeclaredBankTotal(text, "withdrawals") ||
+    getPrimaryAmountByKeywords(text, [
+      "total withdrawals",
+      "withdrawals total",
+      "total debits",
+      "debits total",
+      "electronic withdrawals",
+      "less withdrawals",
+    ]);
+  if (!Number.isFinite(declaredDeposits) && !Number.isFinite(declaredDebits)) {
+    return [];
+  }
+
+  const sectionRollup = summarizeBankSectionLineItems(text);
+  const rowRollup = summarizeBankRowLineItems(text, opening);
+  const depositsRollup =
+    rowRollup.depositCount > sectionRollup.depositCount
+      ? { cents: rowRollup.depositCents, count: rowRollup.depositCount, source: "row-balance" }
+      : { cents: sectionRollup.depositCents, count: sectionRollup.depositCount, source: "section-list" };
+  const debitsRollup =
+    rowRollup.debitCount > sectionRollup.debitCount
+      ? { cents: rowRollup.debitCents, count: rowRollup.debitCount, source: "row-balance" }
+      : { cents: sectionRollup.debitCents, count: sectionRollup.debitCount, source: "section-list" };
+  const unknownRows = rowRollup.unknownRows;
+
+  const clues = [];
+  let depositDeltaCents = null;
+  let debitDeltaCents = null;
+  if (Number.isFinite(declaredDeposits)) {
+    if (depositsRollup.count === 0) {
+      clues.push({
+        type: "Bank anomaly",
+        title: "Could not parse individual deposit line items",
+        snippet: "Total deposits present, but transaction rows were not parseable for deposit rollup.",
+        rawMatch: "total deposits",
+        weight: 0,
+        confidence: 0.7,
+      });
+    } else {
+      depositDeltaCents = Math.abs(depositsRollup.cents - toCents(Math.abs(declaredDeposits)));
+      if (depositDeltaCents > 0) {
+        clues.push({
+          type: "Bank math mismatch",
+          title: "Individual deposits do not add up to total deposits",
+          snippet: `Parsed ${depositsRollup.count} deposits (${depositsRollup.source}) totaling ${toMoney(
+            depositsRollup.cents / 100
+          )} vs total deposits ${toMoney(Math.abs(declaredDeposits))}, mismatch ${toMoney(depositDeltaCents / 100)}.`,
+          rawMatch: "total deposits",
+          weight: 10,
+          confidence: depositsRollup.source === "section-list" ? 0.95 : 0.88,
+        });
+      }
+    }
+  }
+
+  if (Number.isFinite(declaredDebits)) {
+    if (debitsRollup.count === 0) {
+      clues.push({
+        type: "Bank anomaly",
+        title: "Could not parse individual debit line items",
+        snippet: "Total debits/withdrawals present, but transaction rows were not parseable for debit rollup.",
+        rawMatch: "total debits",
+        weight: 0,
+        confidence: 0.7,
+      });
+    } else {
+      debitDeltaCents = Math.abs(debitsRollup.cents - toCents(Math.abs(declaredDebits)));
+      if (debitDeltaCents > 0) {
+        clues.push({
+          type: "Bank math mismatch",
+          title: "Individual debits do not add up to total debits/withdrawals",
+          snippet: `Parsed ${debitsRollup.count} debits (${debitsRollup.source}) totaling ${toMoney(
+            debitsRollup.cents / 100
+          )} vs total debits ${toMoney(Math.abs(declaredDebits))}, mismatch ${toMoney(
+            debitDeltaCents / 100
+          )}. Unknown rows: ${unknownRows}.`,
+          rawMatch: "total debits",
+          weight: 10,
+          confidence: debitsRollup.source === "section-list" ? 0.95 : 0.88,
+        });
+      }
+    }
+  }
+
+  if (diagnosticsOut) {
+    diagnosticsOut.declaredDeposits = Number.isFinite(declaredDeposits) ? Math.abs(declaredDeposits) : null;
+    diagnosticsOut.declaredDebits = Number.isFinite(declaredDebits) ? Math.abs(declaredDebits) : null;
+    diagnosticsOut.sectionRollup = sectionRollup;
+    diagnosticsOut.rowRollup = rowRollup;
+    diagnosticsOut.selectedDepositsRollup = depositsRollup;
+    diagnosticsOut.selectedDebitsRollup = debitsRollup;
+    diagnosticsOut.depositDeltaCents = Number.isFinite(depositDeltaCents) ? depositDeltaCents : null;
+    diagnosticsOut.debitDeltaCents = Number.isFinite(debitDeltaCents) ? debitDeltaCents : null;
+  }
+
+  return clues;
+}
+
+function findBankCoverageDiagnosticsClues(profile, bankDiagnostics) {
+  if (!profile?.likelyBankStatement || !bankDiagnostics) {
+    return [];
+  }
+
+  const declaredDepositsPresent = Number.isFinite(bankDiagnostics.declaredDeposits);
+  const declaredDebitsPresent = Number.isFinite(bankDiagnostics.declaredDebits);
+  if (!declaredDepositsPresent && !declaredDebitsPresent) {
+    return [];
+  }
+
+  const selectedDepositsCount = bankDiagnostics.selectedDepositsRollup?.count || 0;
+  const selectedDebitsCount = bankDiagnostics.selectedDebitsRollup?.count || 0;
+  const selectedTotal = selectedDepositsCount + selectedDebitsCount;
+  const unknownRows = bankDiagnostics.rowRollup?.unknownRows || 0;
+  const unknownRatio = selectedTotal > 0 ? unknownRows / (selectedTotal + unknownRows) : 1;
+
+  const clues = [];
+  if (selectedTotal < 6) {
+    clues.push({
+      type: "Bank anomaly",
+      title: "Too few transaction lines were parsed for reliable reconciliation",
+      snippet: `Parsed ${selectedTotal} signed rows (deposits ${selectedDepositsCount}, debits ${selectedDebitsCount}).`,
+      weight: 7,
+      confidence: 0.9,
+    });
+  }
+
+  if (unknownRows >= 4 || unknownRatio >= 0.35) {
+    clues.push({
+      type: "Bank anomaly",
+      title: "High number of unclassified bank rows limits trust in totals",
+      snippet: `Unknown rows ${unknownRows}, unknown ratio ${(unknownRatio * 100).toFixed(1)}%.`,
+      weight: 8,
+      confidence: 0.9,
+    });
+  }
+
+  if (
+    declaredDepositsPresent &&
+    selectedDepositsCount > 0 &&
+    selectedDebitsCount > 0 &&
+    selectedDepositsCount === selectedDebitsCount
+  ) {
+    clues.push({
+      type: "Bank anomaly",
+      title: "Deposit and debit counts are suspiciously symmetric",
+      snippet: `Detected ${selectedDepositsCount} deposits and ${selectedDebitsCount} debits in selected rollup.`,
+      weight: 4,
+      confidence: 0.78,
+    });
+  }
+
+  return clues;
+}
+
+function summarizeBankRowLineItems(text, openingBalance) {
+  const rows = extractBankTransactionRows(text);
+  if (!rows.length) {
+    return {
+      depositCents: 0,
+      debitCents: 0,
+      depositCount: 0,
+      debitCount: 0,
+      unknownRows: 0,
+    };
+  }
+
+  let depositCents = 0;
+  let debitCents = 0;
+  let depositCount = 0;
+  let debitCount = 0;
+  let unknownRows = 0;
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const previousBalance = i === 0 ? openingBalance : rows[i - 1].balance;
+    const signedAmountCents = resolveRowSignedAmountCents(rows[i], previousBalance);
+    if (!Number.isFinite(signedAmountCents) || signedAmountCents === 0) {
+      unknownRows += 1;
+      continue;
+    }
+    if (signedAmountCents > 0) {
+      depositCents += signedAmountCents;
+      depositCount += 1;
+    } else {
+      debitCents += Math.abs(signedAmountCents);
+      debitCount += 1;
+    }
+  }
+
+  return {
+    depositCents,
+    debitCents,
+    depositCount,
+    debitCount,
+    unknownRows,
+  };
+}
+
+function summarizeBankSectionLineItems(text) {
+  const depositsSection = extractTextWindow(
+    text,
+    ["electronic deposits this statement period", "deposits this statement period", "deposits this period"],
+    ["total electronic deposits", "electronic withdrawals this statement period", "withdrawals this statement period"]
+  );
+  const withdrawalsSection = extractTextWindow(
+    text,
+    ["electronic withdrawals this statement period", "withdrawals this statement period"],
+    ["total electronic withdrawals", "lowest daily balance"]
+  );
+  const depositAmounts = parseBankSectionAmounts(depositsSection);
+  const withdrawalAmounts = parseBankSectionAmounts(withdrawalsSection);
+
+  return {
+    depositCents: depositAmounts.reduce((sum, amount) => sum + Math.abs(toCents(amount)), 0),
+    debitCents: withdrawalAmounts.reduce((sum, amount) => sum + Math.abs(toCents(amount)), 0),
+    depositCount: depositAmounts.length,
+    debitCount: withdrawalAmounts.length,
+  };
+}
+
+function extractTextWindow(text, startMarkers, endMarkers) {
+  const lower = text.toLowerCase();
+  let startIndex = -1;
+  for (const marker of startMarkers) {
+    const idx = lower.indexOf(marker.toLowerCase());
+    if (idx !== -1 && (startIndex === -1 || idx < startIndex)) {
+      startIndex = idx;
+    }
+  }
+  if (startIndex === -1) {
+    return "";
+  }
+
+  let endIndex = text.length;
+  for (const marker of endMarkers) {
+    const idx = lower.indexOf(marker.toLowerCase(), startIndex + 1);
+    if (idx !== -1 && idx < endIndex) {
+      endIndex = idx;
+    }
+  }
+  return text.slice(startIndex, endIndex);
+}
+
+function parseBankSectionAmounts(sectionText) {
+  if (!sectionText) {
+    return [];
+  }
+  const sanitized = sectionText.replace(/[−–—]/g, "-");
+  const regex =
+    /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\s+((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))\b/gi;
+  const values = [];
+  for (const match of sanitized.matchAll(regex)) {
+    const parsed = parseLooseMoneyAmount(match[1]);
+    if (Number.isFinite(parsed) && parsed !== 0) {
+      values.push(parsed);
+    }
+  }
+  return values;
+}
+
+function extractDeclaredBankTotal(text, kind) {
+  const patternList =
+    kind === "deposits"
+      ? [
+          /total(?:\s+[a-z()]+){0,6}\s+deposits?[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
+          /plus\s+deposits?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
+        ]
+      : [
+          /total(?:\s+[a-z()]+){0,6}\s+(?:withdrawals?|debits?)[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
+          /less\s+withdrawals?(?:\s+[a-z()]+){0,4}[\s:]{0,20}((?:-?\s*\$|\$\s*-?)?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2}|\s*\.\s*\d{2}))/gi,
+        ];
+
+  for (const pattern of patternList) {
+    for (const match of text.matchAll(pattern)) {
+      const parsed = parseLooseMoneyAmount(match[1]);
+      if (Number.isFinite(parsed)) {
+        return Math.abs(parsed);
+      }
+    }
+  }
+  return NaN;
+}
+
+function findBankRunningBalanceClues(text, profile) {
+  if (!profile.likelyBankStatement) {
+    return [];
+  }
+
+  const rows = extractBankTransactionRows(text);
+  if (rows.length < 3) {
+    return [];
+  }
+
+  const clues = [];
+  const opening = getPrimaryAmountByKeywords(text, ["beginning balance", "opening balance", "starting balance"]);
+
+  if (Number.isFinite(opening)) {
+    const firstRow = rows[0];
+    const firstEval = evaluateRunningBalanceStep(opening, firstRow);
+    if (!firstEval.withinTolerance) {
+      clues.push({
+        type: "Bank math mismatch",
+        title: "First transaction does not reconcile with opening balance",
+        snippet: `Opening ${toMoney(opening)}, transaction ${firstRow.amountRaw}, resulting balance ${toMoney(firstRow.balance)}.`,
+        rawMatch: firstRow.raw,
+        weight: 8,
+        confidence: 0.85,
+      });
+    }
+  }
+
+  for (let i = 1; i < rows.length; i += 1) {
+    const prev = rows[i - 1];
+    const curr = rows[i];
+    const evaluation = evaluateRunningBalanceStep(prev.balance, curr);
+    if (!evaluation.withinTolerance) {
+      clues.push({
+        type: "Bank math mismatch",
+        title: "Transaction amount does not reconcile with running balance",
+        snippet: `Prior balance ${toMoney(prev.balance)}, transaction ${curr.amountRaw}, next balance ${toMoney(curr.balance)}.`,
+        rawMatch: curr.raw,
+        weight: 8,
+        confidence: 0.84,
+      });
+    }
+    if (clues.length >= 8) {
+      break;
+    }
+  }
+
+  return clues;
+}
+
+function extractBankTransactionRows(text) {
+  const rows = [];
+  const rowRegex =
+    /(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+([A-Za-z0-9&.,'()#\-\/ ]{2,65}?)\s+(\(?-?\$?\d{1,3}(?:,\d{3})*\.\d{2}\)?\s*(?:cr|dr)?)\s+(\(?-?\$?\d{1,3}(?:,\d{3})*\.\d{2}\)?)/gi;
+
+  for (const match of text.matchAll(rowRegex)) {
+    const amountInfo = parseTransactionAmountToken(match[3]);
+    const balance = parseMoney(match[4].replace(/[()$]/g, ""));
+    if (!Number.isFinite(amountInfo.absolute) || !Number.isFinite(balance)) {
+      continue;
+    }
+    rows.push({
+      date: match[1],
+      description: match[2].trim(),
+      amountRaw: match[3].trim(),
+      amountInfo,
+      balance,
+      raw: match[0],
+    });
+    if (rows.length >= 70) {
+      break;
+    }
+  }
+
+  return rows;
+}
+
+function parseTransactionAmountToken(token) {
+  const lower = token.toLowerCase();
+  const hasParens = /\(.*\)/.test(token);
+  const hasMinus = /\-/.test(token);
+  const hasDebit = /\bdr\b/.test(lower);
+  const hasCredit = /\bcr\b/.test(lower);
+  const numeric = parseMoney(token.replace(/[()$]/g, "").replace(/\b(cr|dr)\b/gi, "").trim());
+  const absolute = Number.isFinite(numeric) ? Math.abs(numeric) : NaN;
+
+  if (!Number.isFinite(absolute)) {
+    return { absolute: NaN, candidates: [], signKnown: false };
+  }
+  if (hasDebit || hasParens || hasMinus) {
+    return { absolute, candidates: [-absolute], signKnown: true };
+  }
+  if (hasCredit) {
+    return { absolute, candidates: [absolute], signKnown: true };
+  }
+  return { absolute, candidates: [absolute, -absolute], signKnown: false };
+}
+
+function evaluateRunningBalanceStep(previousBalance, row) {
+  const descriptor = (row.description || "").toLowerCase();
+  let candidateAmounts = [...row.amountInfo.candidates];
+  if (!row.amountInfo.signKnown) {
+    if (/(debit|withdrawal|purchase|pos|atm|fee|payment)/i.test(descriptor)) {
+      candidateAmounts = [-row.amountInfo.absolute];
+    } else if (/(deposit|credit|refund|reversal|payroll)/i.test(descriptor)) {
+      candidateAmounts = [row.amountInfo.absolute];
+    }
+  }
+  if (!candidateAmounts.length) {
+    candidateAmounts = [row.amountInfo.absolute, -row.amountInfo.absolute];
+  }
+
+  const previousCents = toCents(previousBalance);
+  const rowBalanceCents = toCents(row.balance);
+  let bestDeltaCents = Number.POSITIVE_INFINITY;
+  for (const amount of candidateAmounts) {
+    const expectedCents = previousCents + toCents(amount);
+    const deltaCents = Math.abs(expectedCents - rowBalanceCents);
+    if (deltaCents < bestDeltaCents) {
+      bestDeltaCents = deltaCents;
+    }
+  }
+  const toleranceCents = 0;
+  return {
+    deltaCents: bestDeltaCents,
+    toleranceCents,
+    withinTolerance: bestDeltaCents <= toleranceCents,
+  };
+}
+
+function resolveRowSignedAmountCents(row, previousBalance) {
+  if (!row || !row.amountInfo || !Number.isFinite(row.amountInfo.absolute)) {
+    return NaN;
+  }
+
+  const absoluteCents = toCents(row.amountInfo.absolute);
+  if (!Number.isFinite(absoluteCents) || absoluteCents === 0) {
+    return NaN;
+  }
+
+  if (row.amountInfo.signKnown) {
+    const signed = row.amountInfo.candidates[0] || 0;
+    return toCents(signed);
+  }
+
+  if (Number.isFinite(previousBalance) && Number.isFinite(row.balance)) {
+    const deltaCents = toCents(row.balance) - toCents(previousBalance);
+    if (Math.abs(deltaCents) === absoluteCents && deltaCents !== 0) {
+      return deltaCents > 0 ? absoluteCents : -absoluteCents;
+    }
+  }
+
+  const descriptor = (row.description || "").toLowerCase();
+  if (/(deposit|credit|refund|reversal|payroll)/i.test(descriptor)) {
+    return absoluteCents;
+  }
+  if (/(debit|withdrawal|purchase|pos|atm|fee|payment|transfer out)/i.test(descriptor)) {
+    return -absoluteCents;
+  }
+
+  return NaN;
+}
+
 function findPayStubMathClues(text, profile) {
   if (!profile.likelyPayStub) {
     return [];
@@ -653,14 +1189,16 @@ function findPayStubMathClues(text, profile) {
   const rate = getPrimaryAmountByKeywords(text, ["hourly rate", "rate"]);
 
   if ([gross, net, deductions].every((n) => Number.isFinite(n))) {
-    const expectedNet = gross - deductions;
-    const delta = Math.abs(expectedNet - net);
-    const tolerance = Math.max(0.75, Math.abs(gross) * 0.01);
-    if (delta > tolerance) {
+    const expectedNetCents = toCents(gross) - toCents(deductions);
+    const netCents = toCents(net);
+    const deltaCents = Math.abs(expectedNetCents - netCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Pay math mismatch",
         title: "Gross pay minus deductions does not match net pay",
-        snippet: `Gross ${toMoney(gross)}, deductions ${toMoney(deductions)}, net ${toMoney(net)}.`,
+        snippet: `Gross ${toMoney(gross)}, deductions ${toMoney(deductions)}, net ${toMoney(net)}, mismatch ${toMoney(
+          deltaCents / 100
+        )}.`,
         rawMatch: `net pay ${toMoney(net)}`,
         weight: 10,
         confidence: 0.95,
@@ -682,13 +1220,14 @@ function findPayStubMathClues(text, profile) {
 
   if (Number.isFinite(hours) && Number.isFinite(rate) && Number.isFinite(gross)) {
     const expectedGross = hours * rate;
-    const delta = Math.abs(expectedGross - gross);
-    const tolerance = Math.max(2.0, expectedGross * 0.03);
-    if (delta > tolerance) {
+    const expectedGrossCents = toCents(expectedGross);
+    const grossCents = toCents(gross);
+    const deltaCents = Math.abs(expectedGrossCents - grossCents);
+    if (deltaCents > 0) {
       clues.push({
         type: "Pay math mismatch",
         title: "Hours x hourly rate does not align with gross pay",
-        snippet: `Hours ${hours}, rate ${toMoney(rate)}, gross ${toMoney(gross)}.`,
+        snippet: `Hours ${hours}, rate ${toMoney(rate)}, gross ${toMoney(gross)}, mismatch ${toMoney(deltaCents / 100)}.`,
         weight: 8,
         confidence: 0.8,
       });
@@ -707,6 +1246,118 @@ function findPayStubMathClues(text, profile) {
   }
 
   return clues;
+}
+
+function findPayStubLineItemClues(text, profile) {
+  if (!profile.likelyPayStub) {
+    return [];
+  }
+
+  const clues = [];
+  const deductionTotal = getPrimaryAmountByKeywords(text, ["total deductions", "deductions"]);
+  const gross = getPrimaryAmountByKeywords(text, ["gross pay", "current gross"]);
+
+  const deductionItems = collectPayLineItemsByKeywords(text, [
+    "federal tax",
+    "state tax",
+    "local tax",
+    "social security",
+    "medicare",
+    "insurance",
+    "dental",
+    "vision",
+    "retirement",
+    "401k",
+    "garnishment",
+  ]);
+
+  if (Number.isFinite(deductionTotal) && deductionItems.length >= 2) {
+    const deducedTotal = deductionItems.reduce((sum, item) => sum + item.value, 0);
+    const deducedTotalCents = toCents(deducedTotal);
+    const deductionTotalCents = toCents(deductionTotal);
+    const deltaCents = Math.abs(deducedTotalCents - deductionTotalCents);
+    if (deltaCents > 0) {
+      clues.push({
+        type: "Pay math mismatch",
+        title: "Deduction line items do not add up to total deductions",
+        snippet: `Line items ${toMoney(deducedTotal)} vs total deductions ${toMoney(deductionTotal)}, mismatch ${toMoney(
+          deltaCents / 100
+        )}.`,
+        rawMatch: deductionItems[0].raw,
+        weight: 9,
+        confidence: 0.9,
+      });
+    }
+  }
+
+  const earningItems = collectPayLineItemsByKeywords(text, [
+    "regular pay",
+    "overtime",
+    "bonus",
+    "commission",
+    "holiday pay",
+    "vacation pay",
+    "sick pay",
+    "shift differential",
+  ]);
+
+  if (Number.isFinite(gross) && earningItems.length >= 2) {
+    const summedEarnings = earningItems.reduce((sum, item) => sum + item.value, 0);
+    const summedEarningsCents = toCents(summedEarnings);
+    const grossCents = toCents(gross);
+    const deltaCents = Math.abs(summedEarningsCents - grossCents);
+    if (deltaCents > 0) {
+      clues.push({
+        type: "Pay math mismatch",
+        title: "Earning components do not add up to gross pay",
+        snippet: `Line items ${toMoney(summedEarnings)} vs gross pay ${toMoney(gross)}, mismatch ${toMoney(
+          deltaCents / 100
+        )}.`,
+        rawMatch: earningItems[0].raw,
+        weight: 8,
+        confidence: 0.86,
+      });
+    }
+  }
+
+  return clues;
+}
+
+function collectPayLineItemsByKeywords(text, keywords) {
+  const values = [];
+  const seen = new Set();
+  for (const keyword of keywords) {
+    const escaped = escapeRegExp(keyword);
+    const regex = new RegExp(`${escaped}[\\s:\\-]{0,10}(?:[$€£]\\s*)?(-?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)`, "gi");
+    for (const match of text.matchAll(regex)) {
+      const before = text.slice(Math.max(0, match.index - 18), match.index).toLowerCase();
+      if (before.includes("ytd") || before.includes("year to date")) {
+        continue;
+      }
+      if (/total|current|gross pay|net pay/i.test(match[0])) {
+        continue;
+      }
+      const numeric = parseMoney(match[1]);
+      if (!Number.isFinite(numeric) || numeric <= 0) {
+        continue;
+      }
+      const rounded = numeric.toFixed(2);
+      const dedupeKey = `${keyword}:${rounded}`;
+      if (seen.has(dedupeKey)) {
+        continue;
+      }
+      seen.add(dedupeKey);
+      values.push({
+        keyword,
+        value: numeric,
+        raw: match[0],
+      });
+      if (values.length >= 25) {
+        return values;
+      }
+    }
+  }
+  return values;
 }
 
 function findEmployerLegitimacyClues(text, profile) {
@@ -790,6 +1441,164 @@ function findEmployerLegitimacyClues(text, profile) {
   }
 
   return clues;
+}
+
+async function findExternalEmployerVerificationClues(text, profile) {
+  if (!profile.likelyPayStub) {
+    return [];
+  }
+
+  const employerName = extractEmployerNameForVerification(text);
+  if (!employerName || isGenericEmployerLabel(employerName)) {
+    return [];
+  }
+
+  try {
+    const result = await evaluateEmployerPresence(employerName);
+    if (result.status !== "not_found") {
+      return [];
+    }
+
+    const synthetic = looksSyntheticEmployerName(employerName);
+    if (synthetic) {
+      return [
+        {
+          type: "Employer legitimacy",
+          title: "Employer name not found in public search and appears synthetic",
+          snippet: `${employerName} (no strong public search match)`,
+          rawMatch: employerName,
+          weight: 8,
+          confidence: 0.82,
+        },
+      ];
+    }
+
+    return [
+      {
+        type: "Employer legitimacy",
+        title: "No strong public reference found for employer name",
+        snippet: `${employerName} (manual verification recommended)`,
+        rawMatch: employerName,
+        weight: 0,
+        confidence: 0.65,
+      },
+    ];
+  } catch (error) {
+    // Network access is optional for this signal; local checks still run.
+    return [];
+  }
+}
+
+function extractEmployerNameForVerification(text) {
+  const explicit = text.match(/(?:employer|company|business)\s*[:\-]?\s*([A-Za-z0-9&.,'\-\s]{3,70})/i);
+  if (explicit && explicit[1]) {
+    return explicit[1].trim().replace(/\s+/g, " ");
+  }
+
+  const domainEmail = text.match(/\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/);
+  if (domainEmail && domainEmail[1]) {
+    const domain = domainEmail[1].toLowerCase();
+    if (!/(gmail|yahoo|hotmail|outlook|icloud|aol)\.com$/.test(domain)) {
+      const root = domain.replace(/\.(com|net|org|co|io|us|biz)$/i, "");
+      return root.replace(/[-_.]+/g, " ").trim();
+    }
+  }
+
+  return "";
+}
+
+function isGenericEmployerLabel(name) {
+  const normalized = normalizeCompanyName(name);
+  const genericOnly = ["employer", "company", "business", "payroll", "hr", "human resources"];
+  return genericOnly.includes(normalized) || normalized.length < 4;
+}
+
+function looksSyntheticEmployerName(name) {
+  const cleaned = name.trim();
+  const hasEntitySuffix = /\b(inc|llc|ltd|corp|corporation|co|company)\b/i.test(cleaned);
+  const hasManyDigits = (cleaned.match(/\d/g) || []).length >= 4;
+  const weirdRepeats = /(.)\1\1/i.test(cleaned);
+  return !hasEntitySuffix && (hasManyDigits || weirdRepeats);
+}
+
+async function evaluateEmployerPresence(name) {
+  const query = encodeURIComponent(`"${name}" company`);
+  const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${query}&srlimit=5&format=json&origin=*`;
+  const payload = await fetchJsonWithTimeout(url, 6500);
+  const searchResults = payload?.query?.search || [];
+
+  if (!searchResults.length) {
+    return { status: "not_found", score: 0 };
+  }
+
+  const employerTokens = tokenizeCompanyName(name);
+  let bestScore = 0;
+  for (const result of searchResults) {
+    const titleTokens = tokenizeCompanyName(result.title || "");
+    const overlap = tokenOverlapRatio(employerTokens, titleTokens);
+    if (overlap > bestScore) {
+      bestScore = overlap;
+    }
+  }
+
+  if (bestScore >= 0.6) {
+    return { status: "found", score: bestScore };
+  }
+  if (bestScore >= 0.35 || searchResults.length >= 4) {
+    return { status: "weak_match", score: bestScore };
+  }
+  return { status: "not_found", score: bestScore };
+}
+
+function normalizeCompanyName(value) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\b(inc|llc|ltd|corp|corporation|co|company|the)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeCompanyName(value) {
+  const normalized = normalizeCompanyName(value);
+  if (!normalized) {
+    return [];
+  }
+  return normalized.split(" ").filter(Boolean);
+}
+
+function tokenOverlapRatio(aTokens, bTokens) {
+  if (!aTokens.length || !bTokens.length) {
+    return 0;
+  }
+  const bSet = new Set(bTokens);
+  let overlap = 0;
+  for (const token of new Set(aTokens)) {
+    if (bSet.has(token)) {
+      overlap += 1;
+    }
+  }
+  return overlap / Math.max(1, new Set(aTokens).size);
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function findIdAuthenticityClues(text, profile, existingCoreFields) {
@@ -955,10 +1764,11 @@ function findIdAuthenticityClues(text, profile, existingCoreFields) {
 
 function getPrimaryAmountByKeywords(text, keywords) {
   const amounts = [];
+  const normalizedText = normalizeMoneySpacingArtifacts(text);
   for (const keyword of keywords) {
     const escaped = escapeRegExp(keyword);
     const regex = new RegExp(`${escaped}[\\s:\\-]{0,8}(?:[$€£]\\s*)?(-?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?)`, "gi");
-    for (const match of text.matchAll(regex)) {
+    for (const match of normalizedText.matchAll(regex)) {
       const value = parseMoney(match[1]);
       if (Number.isFinite(value)) {
         amounts.push(value);
@@ -1002,8 +1812,40 @@ function parseMoney(value) {
   if (!value) {
     return NaN;
   }
-  const parsed = Number(value.replace(/,/g, ""));
+  const normalized = String(value)
+    .replace(/[−–—]/g, "-")
+    .replace(/^\(\s*(.*)\s*\)$/, "-$1")
+    .replace(/\s+/g, "")
+    .replace(/,/g, "")
+    .replace(/\$/g, "");
+  const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function normalizeMoneySpacingArtifacts(text) {
+  if (!text) {
+    return "";
+  }
+  return String(text)
+    .replace(/\$\s+([0-9])/g, "$$$1")
+    .replace(/([0-9])\s*,\s*([0-9]{3})/g, "$1,$2")
+    .replace(/([0-9])\s*\.\s*([0-9]{2})/g, "$1.$2")
+    .replace(/-\s+\$/g, "-$")
+    .replace(/\$\s+-/g, "$-");
+}
+
+function parseLooseMoneyAmount(value) {
+  if (!value) {
+    return NaN;
+  }
+  return parseMoney(value);
+}
+
+function toCents(value) {
+  if (!Number.isFinite(value)) {
+    return NaN;
+  }
+  return Math.round((value + Number.EPSILON) * 100);
 }
 
 function toMoney(value) {
@@ -1359,6 +2201,7 @@ function renderReport(report) {
   textLengthEl.textContent = String(report.textLength);
   renderAnalysisSummary(report.summary);
   renderDetectionConfidence(report.detectionConfidence);
+  renderDiagnostics(report.diagnostics);
 
   if (!report.clues.length) {
     issuesList.innerHTML =
@@ -1384,6 +2227,77 @@ function renderReport(report) {
 
   issuesList.innerHTML = items;
   renderDocumentPreview(report.pages);
+}
+
+function renderDiagnostics(diagnostics) {
+  if (!diagnosticsPanelEl) {
+    return;
+  }
+  if (!diagnostics) {
+    diagnosticsPanelEl.innerHTML = '<p class="empty">No diagnostics available.</p>';
+    return;
+  }
+
+  const lines = [];
+  lines.push(`Detected type: ${getDetectedTypeLabel(diagnostics.profile || {})}`);
+  lines.push(`Text source: ${diagnostics.textSourceSummary || "unknown"}`);
+
+  if (diagnostics.pageSources && diagnostics.pageSources.length) {
+    lines.push(`Page sources: ${diagnostics.pageSources.join(", ")}`);
+  }
+
+  if (diagnostics.bankLineItems) {
+    const bank = diagnostics.bankLineItems;
+    lines.push("");
+    lines.push("Bank line-item reconciliation:");
+    lines.push(`  Declared deposits: ${formatDiagnosticMoney(bank.declaredDeposits)}`);
+    lines.push(`  Declared debits: ${formatDiagnosticMoney(bank.declaredDebits)}`);
+    lines.push(
+      `  Section rollup deposits: count=${bank.sectionRollup?.depositCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.sectionRollup?.depositCents)
+      )}`
+    );
+    lines.push(
+      `  Section rollup debits: count=${bank.sectionRollup?.debitCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.sectionRollup?.debitCents)
+      )}`
+    );
+    lines.push(
+      `  Row rollup deposits: count=${bank.rowRollup?.depositCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.rowRollup?.depositCents)
+      )}`
+    );
+    lines.push(
+      `  Row rollup debits: count=${bank.rowRollup?.debitCount ?? 0}, total=${formatDiagnosticMoney(
+        centsToMoney(bank.rowRollup?.debitCents)
+      )}`
+    );
+    lines.push(`  Row unknown count: ${bank.rowRollup?.unknownRows ?? 0}`);
+    lines.push(
+      `  Selected deposits source: ${bank.selectedDepositsRollup?.source || "n/a"} (${bank.selectedDepositsRollup?.count || 0} rows)`
+    );
+    lines.push(
+      `  Selected debits source: ${bank.selectedDebitsRollup?.source || "n/a"} (${bank.selectedDebitsRollup?.count || 0} rows)`
+    );
+    lines.push(`  Deposit delta: ${formatDiagnosticMoney(centsToMoney(bank.depositDeltaCents))}`);
+    lines.push(`  Debit delta: ${formatDiagnosticMoney(centsToMoney(bank.debitDeltaCents))}`);
+  }
+
+  diagnosticsPanelEl.innerHTML = `<pre class="diagnostics-pre">${escapeHtml(lines.join("\n"))}</pre>`;
+}
+
+function centsToMoney(cents) {
+  if (!Number.isFinite(cents)) {
+    return NaN;
+  }
+  return cents / 100;
+}
+
+function formatDiagnosticMoney(value) {
+  if (!Number.isFinite(value)) {
+    return "Not found";
+  }
+  return `$${toMoney(value)}`;
 }
 
 function renderAnalysisSummary(summary) {
@@ -1524,6 +2438,30 @@ function computeDetectionConfidence(extracted, profile, summary, scanMode) {
   else if (score >= 60) level = "Medium";
 
   return { score, level };
+}
+
+function buildReportDiagnostics(extracted, profile, bankLineItemDiagnostics) {
+  const textSources = extracted?.analysisMeta?.textSourceDetails || [];
+  const nativeCount = textSources.filter((entry) => entry.source === "native").length;
+  const ocrCount = textSources.filter((entry) => entry.source === "ocr").length;
+  const pageSources = textSources.map((entry) => `p${entry.pageNumber}:${entry.source}`);
+
+  const textSourceSummary =
+    textSources.length === 0
+      ? "unknown"
+      : nativeCount > 0 && ocrCount === 0
+      ? "native"
+      : nativeCount === 0
+      ? "ocr"
+      : `mixed (native ${nativeCount}, ocr ${ocrCount})`;
+
+  return {
+    profile,
+    textSourceSummary,
+    pageSources,
+    bankLineItems:
+      bankLineItemDiagnostics && Object.keys(bankLineItemDiagnostics).length ? bankLineItemDiagnostics : null,
+  };
 }
 
 function attachHighlights(report, pages) {
